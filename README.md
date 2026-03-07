@@ -1,4 +1,3 @@
-[Uploading README.md…]()
 # astrbot_plugin_nailong
 
 一个基于 [AstrBot](https://github.com/Soulter/AstrBot) 的奶龙表情包插件，支持随机发送表情、GIF 变速、GIF 倒放以及动态添加新表情。

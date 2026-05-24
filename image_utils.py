@@ -194,7 +194,7 @@ def save_rgba_frames_as_gif(frames: List[Image.Image],
         raise
 
 def adjust_gif_speed(gif_path: str, speed_factor: float, output_path: str) -> None:
-    """调整 GIF 播放速度，保留透明背景，失败抛出异常"""
+    """调整 GIF 播放速度，保留所有帧，失败抛出异常"""
     if not is_gif(gif_path):
         raise ValueError("文件不是有效的 GIF")
     frames, durations, disposals, loop, transparencies = process_gif_preserve(gif_path)
@@ -204,8 +204,25 @@ def adjust_gif_speed(gif_path: str, speed_factor: float, output_path: str) -> No
         rgba_frames = frames_to_rgba_preserve(frames)
         for f in frames:
             f.close()
-        new_durations = [max(20, int(d / speed_factor)) for d in durations]
-        save_rgba_frames_as_gif(rgba_frames, new_durations, loop, output_path, transparencies)
+        
+        if speed_factor >= 1:
+            # 加速：采样帧，但采用平均采样而不是简单的::step
+            # 比如加速2倍时，100帧采样到50帧；加速4倍时，采样到25帧
+            target_frame_count = max(2, int(len(rgba_frames) / speed_factor))
+            indices = [int(i * len(rgba_frames) / target_frame_count) for i in range(target_frame_count)]
+            selected_frames = [rgba_frames[i] for i in indices]
+            selected_durations = [durations[i] if i < len(durations) else 100 for i in indices]
+            save_rgba_frames_as_gif(selected_frames, selected_durations, loop, output_path, transparencies)
+        else:
+            # 慢放：复制帧，同时延长每帧的显示时间
+            repeat = max(1, int(round(1 / speed_factor)))
+            expanded_frames = []
+            expanded_durations = []
+            for i, frame in enumerate(rgba_frames):
+                for _ in range(repeat):
+                    expanded_frames.append(frame.copy())
+                    expanded_durations.append(int(durations[i] * repeat) if i < len(durations) else 100)
+            save_rgba_frames_as_gif(expanded_frames, expanded_durations, loop, output_path, transparencies)
     except Exception as e:
         for f in frames:
             f.close()

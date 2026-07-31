@@ -11,12 +11,31 @@ import aiohttp
 from PIL import Image as PILImage
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api.message_components import Image, Reply, Face, MFace
+from astrbot.api.message_components import Image, Reply, Face
+try:
+    from astrbot.api.message_components import MFace
+except ImportError:
+    MFace = None  # MFace 在新版 astrbot 中已移除
 from astrbot.api import logger
 
 # 导入图像处理模块
 from . import image_utils
-import apng  # 用于读取 QQ 本地大表情的 APNG 文件
+
+# ===== 本地 QQ 表情资源目录配置 =====
+# 处理 [表情:123] 等系统表情时，优先直接读取本机 QQ 客户端缓存的
+# sysface_res 目录下的 s{id}.png 文件，避免 CDN 下载、离线可用且速度更快。
+# 插件通常运行在 WSL Ubuntu 中，Windows E 盘通过 /mnt/e/ 访问；
+# 也可通过环境变量 NAILONG_LOCAL_FACE_DIR 自定义目录。
+_LOCAL_FACE_DIR_ENV = "NAILONG_LOCAL_FACE_DIR"
+_LOCAL_FACE_DIRS = [
+    # WSL 下 Windows E 盘的挂载路径
+    "/mnt/e/新建文件夹 (2)/nt_qq/global/nt_data/Emoji/emoji-resource/sysface_res/apng",
+    # Windows 原生路径（正斜杠 / 反斜杠两种写法）
+    "E:/新建文件夹 (2)/nt_qq/global/nt_data/Emoji/emoji-resource/sysface_res/apng",
+    r"E:\新建文件夹 (2)\nt_qq\global\nt_data\Emoji\emoji-resource\sysface_res\apng",
+]
+# 本地表情文件可能的扩展名（目录名为 apng，实际文件为 png）
+_LOCAL_FACE_EXTS = (".png", ".apng", ".gif")
 
 @register("astrbot_plugin_nailong", "Logxk", "一个发送奶龙表情包的插件", "1.0.0")
 class MemePlugin(Star):
@@ -36,8 +55,12 @@ class MemePlugin(Star):
         self.processing_semaphore = asyncio.Semaphore(max_concurrent)
         logger.info(f"并发限流已启用，最大同时处理数: {max_concurrent}")
 
-        # 全局 HTTP 会话（复用连接池）
-        self.session = aiohttp.ClientSession()
+        # 全局 HTTP 会话（复用连接池，禁用系统代理避免代理故障影响图片下载）
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            trust_env=False,  # 忽略 HTTP_PROXY/HTTPS_PROXY 环境变量
+        )
 
         # 后台清理任务
         self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
@@ -93,13 +116,119 @@ class MemePlugin(Star):
             logger.info("后台清理任务被取消")
             raise
 
-    def _extract_image_from_event(self, event: AstrMessageEvent) -> Optional[Image]:
+    def _get_mentioned_qq(self, event: AstrMessageEvent) -> Optional[str]:
+        """从消息中提取第一个被 @ 的用户的 QQ 号（排除 @全体成员）"""
+        for seg in event.message_obj.message:
+            from astrbot.api.message_components import At
+            if isinstance(seg, At):
+                qq = getattr(seg, 'qq', None)
+                if qq and str(qq) != 'all':
+                    return str(qq)
+        return None
+
+    async def _download_avatar(self, qq: str) -> Optional[str]:
+        """下载指定 QQ 号的头像到临时目录，返回文件路径"""
+        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=640"
+        try:
+            async with self.session.get(avatar_url) as resp:
+                if resp.status == 200:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    dest = os.path.join(self.temp_dir, f"avatar_{qq}_{timestamp}.png")
+                    with open(dest, 'wb') as f:
+                        f.write(await resp.read())
+                    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                        return dest
+        except Exception as e:
+            logger.error(f"下载头像失败 (qq={qq}): {e}")
+        return None
+
+    async def _process_avatar_command(
+        self,
+        event: AstrMessageEvent,
+        handler: Callable,
+        output_prefix: str,
+        *handler_args,
+    ):
+        """通用头像处理：优先处理被 @ 用户头像，其次发言者头像，最后要求引用图片
+        handler 签名为 (input_path, output_path, *handler_args)"""
+        event.stop_event()
+        # 优先：被 @ 的用户
+        mentioned_qq = self._get_mentioned_qq(event)
+        if mentioned_qq:
+            avatar_path = await self._download_avatar(mentioned_qq)
+            if avatar_path:
+                try:
+                    timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_path = os.path.join(self.temp_dir, f"{output_prefix}_{timestamp_out}.png")
+                    async with self.processing_semaphore:
+                        await asyncio.to_thread(handler, avatar_path, output_path, *handler_args)
+                        if os.path.exists(output_path):
+                            img_seg = Image.fromFileSystem(output_path)
+                            yield event.chain_result([img_seg])
+                        else:
+                            yield event.plain_result("❌ 处理失败，输出文件未生成")
+                except Exception as e:
+                    logger.error(f"处理头像时出错: {e}", exc_info=True)
+                    yield event.plain_result(f"❌ 处理失败：{str(e)}")
+                finally:
+                    if os.path.exists(avatar_path):
+                        os.remove(avatar_path)
+                    if os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+                return
+
+        # 其次：发言者自己的头像
+        user_id = self._get_user_id_from_event(event)
+        if user_id:
+            avatar_path = await self._download_avatar(user_id)
+            if avatar_path:
+                try:
+                    timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_path = os.path.join(self.temp_dir, f"{output_prefix}_{timestamp_out}.png")
+                    async with self.processing_semaphore:
+                        await asyncio.to_thread(handler, avatar_path, output_path, *handler_args)
+                        if os.path.exists(output_path):
+                            img_seg = Image.fromFileSystem(output_path)
+                            yield event.chain_result([img_seg])
+                        else:
+                            yield event.plain_result("❌ 处理失败，输出文件未生成")
+                except Exception as e:
+                    logger.error(f"处理头像时出错: {e}", exc_info=True)
+                    yield event.plain_result(f"❌ 处理失败：{str(e)}")
+                finally:
+                    if os.path.exists(avatar_path):
+                        os.remove(avatar_path)
+                    if os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+                return
+
+        # 兜底：要求引用图片
+        yield event.plain_result("牛魔，你引用的图呢？")
+
+    async def _extract_image_from_event(self, event: AstrMessageEvent) -> Optional[Image]:
         """从QQ消息事件中提取图像或QQ表情（黄脸、互动、商城表情包等）
         
         策略：
-        1. 先尝试从消息链中提取 Image/Face
+        1. 先尝试从消息链中提取 Image/Face/MFace
         2. 再从 raw_message 中提取被框架忽略的 mface 段（商城表情包）
+        3. 若仍未找到，通过 OneBot get_msg API 获取被引用消息中的 mface
         """
+        # 先尝试同步提取（消息链 + raw_message）
+        result = self._extract_image_from_event_sync(event)
+        if result is not None:
+            return result
+        
+        # 最后尝试：通过 OneBot API 获取被引用消息中的 mface
+        return await self._resolve_mface_from_reply(event)
+    
+    def _extract_image_from_event_sync(self, event: AstrMessageEvent) -> Optional[Image]:
+        """同步提取：消息链 + raw_message（不含 API 调用）"""
         face_id = None
         face_url = None
         
@@ -111,88 +240,318 @@ class MemePlugin(Star):
                         return sub
                     elif isinstance(sub, Face):
                         face_id = sub.id
-                    elif isinstance(sub, MFace):
+                    elif MFace is not None and isinstance(sub, MFace):
                         face_url = sub.url if hasattr(sub, 'url') and sub.url else None
+                        mface_id = getattr(sub, 'id', None)
+                        if mface_id is not None:
+                            try:
+                                face_id = int(mface_id)
+                            except (ValueError, TypeError):
+                                pass
             elif isinstance(seg, Image):
                 return seg
             elif isinstance(seg, Face):
                 face_id = seg.id
-            elif isinstance(seg, MFace):
+            elif MFace is not None and isinstance(seg, MFace):
                 # MFace 自带 url（适配器已解析）
                 face_url = seg.url if hasattr(seg, 'url') and seg.url else None
+                mface_id = getattr(seg, 'id', None)
+                if mface_id is not None:
+                    try:
+                        face_id = int(mface_id)
+                    except (ValueError, TypeError):
+                        pass
         
         # 第二步：从 raw_message 中提取被框架过滤掉的 mface（商城表情包）
+        raw_mface_url, raw_mface_id = self._extract_mface_from_raw(event)
         if not face_url:
-            face_url = self._extract_mface_from_raw(event)
+            face_url = raw_mface_url
+        # raw_message 中的 face_id 优先（因为包含商城表情 ID）
+        if raw_mface_id is not None:
+            face_id = raw_mface_id
         
-        # 处理 mface（商城表情包，直接有URL）
+        # 处理 mface（QQ商城表情包）：URL 优先，face_id 作回退
+        if face_url and face_id is not None:
+            # 同时有 URL 和 face_id：URL 优先，face_id URL 作回退
+            fallback_urls = self._get_qq_face_urls(face_id)
+            logger.info(f"mface 商城表情: id={face_id}, 主URL={face_url[:80]}, 回退URL数={len(fallback_urls)}")
+            return self._make_image_from_url(face_url, fallback_urls=fallback_urls)
+        
         if face_url:
+            # 仅有 URL，无 face_id
+            logger.info(f"mface 仅有URL, 无face_id: {face_url[:80]}")
             return self._make_image_from_url(face_url)
         
-        # 处理 Face（QQ黄脸/互动表情）
+        # 处理 Face（QQ黄脸/互动表情/商城表情通过 face_id）
         if face_id is not None:
-            # 优先尝试本地 APNG 文件（QQ NT 大表情）
-            self_id = (getattr(event, 'self_id', None) or getattr(event.message_obj, 'self_id', '') or (event.get_self_id() if hasattr(event, 'get_self_id') else ''))
-            local_apng = self._find_local_face_apng(str(self_id), face_id)
-            if local_apng:
-                frames, durations = self._convert_apng_to_gif_frames(local_apng)
-                if frames and len(frames) > 0:
-                    logger.info(f"从本地 APNG 加载表情 {face_id}: {len(frames)} 帧")
-                    return self._make_image_from_local_frames(frames, durations)
+            # 优先使用本地表情文件（QQ 客户端缓存的 sysface_res），避免 CDN 下载
+            local_img = self._make_image_from_local_face(face_id)
+            if local_img is not None:
+                return local_img
+            # 本地无对应文件，回退到 CDN URL
+            qq_face_urls = self._get_qq_face_urls(face_id)
+            if qq_face_urls:
+                return self._make_image_from_url(qq_face_urls[0], fallback_urls=qq_face_urls[1:])
+
+        # 兜底：从 message_str 中解析 [表情:123] 文本表情
+        # （当适配器未将表情解析为 Face 段、仅以文本形式保留时）
+        local_img = self._extract_local_face_from_text(event)
+        if local_img is not None:
+            return local_img
+
+        return None
+    
+    async def _resolve_mface_from_reply(self, event: AstrMessageEvent) -> Optional[Image]:
+        """通过 OneBot get_msg API 获取被引用消息中的 mface（商城表情）
+        
+        当消息链和 raw_message 都无法提取到 mface 时（例如 aiocqhttp 适配器
+        不在 reply 段中内嵌原始消息），通过 API 主动获取被引用的原始消息。
+        """
+        # 1. 提取 reply message_id
+        reply_id = self._get_reply_message_id(event)
+        if not reply_id:
+            logger.debug("无法提取 reply message_id，跳过 API 查询")
+            return None
+        
+        # 2. 调用 OneBot get_msg API
+        try:
+            bot = getattr(event, 'bot', None)
+            api = getattr(bot, 'api', None)
+            call_action = getattr(api, 'call_action', None)
+            if not callable(call_action):
+                logger.debug("无法获取 OneBot call_action，跳过 API 查询")
+                return None
             
-            # 回退到 CDN URL
+            logger.info(f"尝试通过 get_msg API 获取被引用消息: message_id={reply_id}")
+            result = await call_action('get_msg', message_id=str(reply_id))
+        except Exception as e:
+            logger.warning(f"调用 get_msg API 失败: {e}")
+            return None
+        
+        if not isinstance(result, dict):
+            logger.debug(f"get_msg 返回非 dict 类型: {type(result)}")
+            return None
+        
+        # 3. 解析响应中的 message 数组，查找 mface
+        data = result.get('data', result)  # get_msg 响应通常在 data 字段中
+        if isinstance(data, dict):
+            message_array = data.get('message', data.get('message_list', []))
+        elif isinstance(data, list):
+            message_array = data
+        else:
+            logger.debug(f"get_msg 响应格式未知: {type(result)}")
+            return None
+        
+        if not message_array:
+            logger.debug("get_msg 响应中无 message 数组")
+            return None
+        
+        # 4. 在消息段中搜索 mface
+        url, face_id = self._search_mface_in_segments(message_array)
+        if url is None and face_id is None:
+            logger.debug("get_msg 响应中未找到 mface 段")
+            return None
+        
+        logger.info(f"通过 get_msg API 找到商城表情: id={face_id}, url={url[:80] if url else '无'}")
+        
+        # 5. 构造 Image（与 sync 方法相同的逻辑）
+        if url and face_id is not None:
+            fallback_urls = self._get_qq_face_urls(face_id)
+            return self._make_image_from_url(url, fallback_urls=fallback_urls)
+        elif url:
+            return self._make_image_from_url(url)
+        elif face_id is not None:
             qq_face_urls = self._get_qq_face_urls(face_id)
             if qq_face_urls:
                 return self._make_image_from_url(qq_face_urls[0], fallback_urls=qq_face_urls[1:])
         
         return None
     
-    def _extract_mface_from_raw(self, event: AstrMessageEvent) -> Optional[str]:
-        """从 raw_message 中提取 mface/face 的 URL（包括被框架忽略的段和额外数据）"""
+    def _get_reply_message_id(self, event: AstrMessageEvent) -> Optional[str]:
+        """从事件中提取 reply 的 message_id"""
+        # 方式1：从已解析的 Reply 组件中获取
+        for seg in event.message_obj.message:
+            if isinstance(seg, Reply):
+                reply_id = getattr(seg, 'id', None)
+                if reply_id:
+                    return str(reply_id)
+        
+        # 方式2：从 raw_message 的 reply 段中获取
+        raw = getattr(event.message_obj, 'raw_message', None)
+        if raw:
+            message_array = getattr(raw, 'message', None) or getattr(raw, 'message_list', None)
+            if message_array:
+                for msg_seg in message_array:
+                    seg_type = msg_seg.get('type', '') if isinstance(msg_seg, dict) else getattr(msg_seg, 'type', '')
+                    if seg_type == 'reply':
+                        seg_data = msg_seg.get('data', {}) if isinstance(msg_seg, dict) else getattr(msg_seg, 'data', {})
+                        reply_id = seg_data.get('id', None) if isinstance(seg_data, dict) else None
+                        if reply_id:
+                            return str(reply_id)
+        
+        return None
+    
+    def _extract_mface_from_raw(self, event: AstrMessageEvent) -> Tuple[Optional[str], Optional[int]]:
+        """从 raw_message 中提取 mface 的 URL 和 face_id（包括被框架忽略的段和额外数据）
+        
+        支持递归搜索 reply 段中嵌套的原始消息内容。
+        
+        Returns:
+            (url, face_id) — url 为 CDN 直接地址，face_id 用于构造回退 URL
+        """
         raw = getattr(event.message_obj, 'raw_message', None)
         if not raw:
-            return None
+            logger.debug("raw_message 为空，无法提取 mface")
+            return None, None
         
         message_array = getattr(raw, 'message', None) or getattr(raw, 'message_list', None)
         if not message_array:
-            return None
+            # 记录 raw 的类型和属性用于调试
+            logger.debug(f"raw_message 无 message/message_list 字段, type={type(raw).__name__}, attrs={[a for a in dir(raw) if not a.startswith('_')]}")
+            return None, None
         
-        for msg_seg in message_array:
+        return self._search_mface_in_segments(message_array)
+    
+    def _search_mface_in_segments(self, segments: list) -> Tuple[Optional[str], Optional[int]]:
+        """递归搜索消息段列表中的 mface/face 数据
+        
+        支持场景：
+        - 直接发送商城表情：mface 在顶层段中
+        - 引用商城表情后发命令：mface 嵌套在 reply 段的 data.message 中
+        """
+        if not segments:
+            return None, None
+        
+        for msg_seg in segments:
             seg_data = msg_seg.get('data', {}) if isinstance(msg_seg, dict) else getattr(msg_seg, 'data', {})
             seg_type = msg_seg.get('type', '') if isinstance(msg_seg, dict) else getattr(msg_seg, 'type', '')
             
             if not isinstance(seg_data, dict):
                 seg_data = getattr(msg_seg, '__dict__', {}) if hasattr(msg_seg, '__dict__') else {}
             
-            # mface 直接有 url
+            # mface（QQ商城表情）：提取 url 和 id
             if seg_type == 'mface':
                 url = seg_data.get('url', '')
-                if url:
-                    logger.info(f"从 raw_message 提取到 mface URL: {url}")
-                    return url
+                face_id = seg_data.get('id', None)
+                # id 可能是 int 或 str
+                if face_id is not None:
+                    try:
+                        face_id = int(face_id)
+                    except (ValueError, TypeError):
+                        face_id = None
+                logger.info(f"从 raw_message 提取到 mface: id={face_id}, url={url[:80] if url else '无'}")
+                return url if url else None, face_id
             
             # face 段可能附带 url（LLBot 等实现）
             if seg_type == 'face':
                 if 'url' in seg_data and seg_data['url']:
                     url = seg_data['url']
-                    logger.info(f"从 raw_message face 段提取到 URL: id={seg_data.get('id')}, url={url}")
-                    return url
+                    face_id = seg_data.get('id', None)
+                    if face_id is not None:
+                        try:
+                            face_id = int(face_id)
+                        except (ValueError, TypeError):
+                            face_id = None
+                    logger.info(f"从 raw_message face 段提取到: id={face_id}, url={url[:80]}")
+                    return url, face_id
                 # 记录 face 段完整数据用于调试
                 logger.debug(f"raw_message face 段数据: {seg_data}")
+            
+            # reply 段：递归搜索嵌套的原始消息内容（引用商城表情后发命令的场景）
+            if seg_type == 'reply':
+                # 不同 OneBot 实现可能使用不同的字段名嵌套原始消息
+                nested_msg = (
+                    seg_data.get('message', None)
+                    or seg_data.get('message_list', None)
+                    or seg_data.get('messages', None)
+                )
+                if nested_msg and isinstance(nested_msg, list) and len(nested_msg) > 0:
+                    logger.debug(f"递归搜索 reply 段中的嵌套消息: {len(nested_msg)} 段")
+                    url, face_id = self._search_mface_in_segments(nested_msg)
+                    if url is not None or face_id is not None:
+                        return url, face_id
         
+        return None, None
+
+    def _get_local_face_dir(self) -> Optional[str]:
+        """返回本地 QQ 表情资源目录（存在且为目录），不存在返回 None"""
+        env_dir = os.getenv(_LOCAL_FACE_DIR_ENV, "").strip()
+        if env_dir and os.path.isdir(env_dir):
+            return env_dir
+        for d in _LOCAL_FACE_DIRS:
+            if os.path.isdir(d):
+                return d
         return None
 
+    def _get_local_face_path(self, face_id) -> Optional[str]:
+        """根据表情 ID 返回本地表情文件路径 s{id}.png，本地无对应文件时返回 None"""
+        if face_id is None:
+            return None
+        try:
+            face_id = int(face_id)
+        except (ValueError, TypeError):
+            return None
+        if face_id < 0:
+            return None
+        face_dir = self._get_local_face_dir()
+        if not face_dir:
+            return None
+        for ext in _LOCAL_FACE_EXTS:
+            path = os.path.join(face_dir, f"s{face_id}{ext}")
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _make_image_from_local_face(self, face_id) -> Optional[Image]:
+        """创建指向本地表情文件的 Image 对象（file 为本地绝对路径），本地无对应文件时返回 None"""
+        local_path = self._get_local_face_path(face_id)
+        if not local_path:
+            return None
+        logger.info(f"使用本地表情文件: id={face_id}, path={local_path}")
+        img = Image(file=local_path)
+        img.path = local_path
+        return img
+
+    def _extract_local_face_from_text(self, event: AstrMessageEvent) -> Optional[Image]:
+        """从 message_str 中解析 [表情:123] 格式的文本表情，并尝试使用本地表情文件"""
+        message_str = getattr(event, 'message_str', '') or ''
+        match = re.search(r'\[表情:(\d+)\]', message_str)
+        if not match:
+            return None
+        face_id = int(match.group(1))
+        return self._make_image_from_local_face(face_id)
+
     def _get_qq_face_urls(self, face_id: int):
-        """返回QQ表情的候选URL列表（按优先级排列）"""
-        if not (0 <= face_id <= 500):
+        """返回QQ表情的候选URL列表（按优先级排列）
+        
+        支持：
+        - QQ黄脸表情 (0-246): qzonestyle CDN
+        - QQ互动/大表情 (0-500): gxh.vip.qq.com
+        - QQ商城表情 (任意ID): gxh.vip.qq.com + 其他回退
+        """
+        if face_id < 0:
             return []
         urls = []
+        
+        # 经典黄脸表情 (0-246) 专用 CDN（GIF 格式）
         if face_id <= 246:
             urls.append(f"https://qzonestyle.gtimg.cn/qzone/em/e{face_id}.gif")
+        
+        # QQ商城表情 / 大表情 通用 CDN（支持任意 ID）
         urls.append(f"https://gxh.vip.qq.com/emojigxh/show?id={face_id}")
+        
+        # 大表情备用参数（>246 时尝试 t=1 参数）
         if face_id > 246:
             urls.append(f"https://gxh.vip.qq.com/emojigxh/show?id={face_id}&t=1")
-        urls.append(f"https://face.qq.com/scripts/face/qqface/{face_id}.gif")
+        
+        # 旧版 CDN 回退
+        if face_id <= 500:
+            urls.append(f"https://face.qq.com/scripts/face/qqface/{face_id}.gif")
+        
+        # 商城表情额外回退源
+        if face_id > 246:
+            urls.append(f"https://gxh.vip.qq.com/emojigxh/preview?id={face_id}")
+        
         return urls
 
 
@@ -212,24 +571,6 @@ class MemePlugin(Star):
         else:
             img.url = url
         return img
-
-    def _make_image_from_local_frames(self, frames, durations):
-        """将本地 APNG 帧列表保存为临时 GIF 并返回 Image 对象"""
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_gif = os.path.join(self.temp_dir, f"local_face_{timestamp}.gif")
-        try:
-            frames[0].save(
-                temp_gif, save_all=True, append_images=frames[1:],
-                duration=durations, loop=0, disposal=2, optimize=False
-            )
-            img = Image(file=temp_gif)
-            return img
-        except Exception as e:
-            logger.error(f"保存本地表情 GIF 失败: {e}")
-            temp_png = os.path.join(self.temp_dir, f"local_face_{timestamp}.png")
-            frames[0].save(temp_png, format="PNG")
-            return Image(file=temp_png)
 
     def _get_user_id_from_event(self, event: AstrMessageEvent) -> Optional[str]:
         """从事件对象中提取用户ID"""
@@ -271,88 +612,6 @@ class MemePlugin(Star):
         logger.debug(f"获取用户ID - session_id: {getattr(event, 'session_id', 'N/A')}, user_id_attr: {getattr(event, 'user_id', 'N/A')}, result: {user_id}")
         return user_id
 
-    # QQ 大表情本地路径配置（可通过环境变量 NAILONG_QQ_EMOJI_PATH 覆盖）
-    def _get_qq_emoji_base_path(self, self_id: str) -> str:
-        """自动检测 QQ NT 表情资源目录"""
-        # 优先使用环境变量
-        env_path = os.getenv("NAILONG_QQ_EMOJI_PATH")
-        if env_path and os.path.isdir(env_path):
-            return env_path
-        
-        # 尝试常见路径（优先使用相对路径和可移植路径，跨平台兼容）
-        import glob
-        import sys
-
-        patterns = [
-            # 相对路径：插件目录下的 qq_emoji 文件夹（跨平台，推荐）
-            os.path.join(self.plugin_dir, "qq_emoji"),
-        ]
-
-        # Linux 下 QQ NT 常见路径
-        linux_patterns = [
-            os.path.expanduser(f"~/.local/share/QQ/nt_qq/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"),
-            os.path.expanduser(f"~/snap/qq/current/.local/share/QQ/nt_qq/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"),
-            os.path.expanduser(f"~/.var/app/com.qq.QQ.desktop/data/QQ/nt_qq/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"),
-        ]
-
-        # Windows 下 QQ NT 常见路径
-        windows_patterns = [
-            os.path.expanduser(f"~/Documents/Tencent Files/{self_id}/nt_qq/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"),
-            os.path.expanduser(f"~/Tencent Files/{self_id}/nt_qq/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"),
-        ]
-
-        # 根据平台优先排列检测顺序
-        if sys.platform.startswith('linux'):
-            patterns.extend(linux_patterns)
-            patterns.extend(windows_patterns)
-        else:
-            patterns.extend(windows_patterns)
-            patterns.extend(linux_patterns)
-
-        for pattern in patterns:
-            # 对于不含通配符的路径直接检查
-            if '*' not in pattern:
-                if os.path.isdir(pattern):
-                    logger.info(f"自动检测到 QQ 表情目录: {pattern}")
-                    return pattern
-                continue
-            matches = glob.glob(pattern)
-            for m in matches:
-                if os.path.isdir(m):
-                    logger.info(f"自动检测到 QQ 表情目录: {m}")
-                    return m
-        return None
-
-    def _find_local_face_apng(self, self_id: str, face_id: int) -> str:
-        """查找本地 QQ 大表情的 APNG 文件路径"""
-        base = self._get_qq_emoji_base_path(self_id)
-        if not base:
-            return None
-        apng_path = os.path.join(base, str(face_id), "apng", f"{face_id}.png")
-        if os.path.isfile(apng_path):
-            return apng_path
-        return None
-
-    def _convert_apng_to_gif_frames(self, apng_path: str):
-        """将 APNG 文件转换为帧列表和时长列表，失败返回 (None, None)"""
-        try:
-            from io import BytesIO
-            from PIL import Image as PILImage
-            reader = apng.APNG.open(apng_path)
-            frames = []
-            durations = []
-            for i, (png_obj, control) in enumerate(reader.frames):
-                # apng 库返回 PNG 对象，需要用 to_bytes() 获取原始数据
-                img = PILImage.open(BytesIO(png_obj.to_bytes()))
-                frames.append(img.convert("RGBA"))
-                # delay 单位：delay/delay_den 秒
-                denom = control.delay_den if control.delay_den > 0 else 100
-                delay = int(control.delay / denom * 1000)
-                durations.append(max(5, delay))
-            return frames, durations
-        except Exception as e:
-            logger.debug(f"APNG 解析失败 {apng_path}: {e}")
-            return None, None
     async def _download_image_to_temp(self, image: Image) -> Tuple[Optional[str], Optional[str]]:
         """
         将图片组件保存到临时文件夹，并立即创建安全副本。
@@ -413,18 +672,33 @@ class MemePlugin(Star):
             last_error = None
             for try_url in urls_to_try:
                 try:
-                    async with self.session.get(try_url) as resp:
+                    # QQ CDN 可能需要合适的 User-Agent 和 Referer
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Referer': 'https://qun.qq.com/',
+                    }
+                    async with self.session.get(try_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                         if resp.status != 200:
                             last_error = f"HTTP {resp.status}"
+                            logger.debug(f"表情URL返回非200: {try_url[:80]} -> {resp.status}")
                             continue
                         content_type = resp.headers.get('Content-Type', '')
+                        # QQ CDN 有时返回 text/html 但内容是图片，信任 URL 扩展名
                         ext_map = {
                             'image/jpeg': '.jpg',
                             'image/png': '.png',
                             'image/gif': '.gif',
                             'image/webp': '.webp',
                         }
-                        ext = ext_map.get(content_type.split(';')[0], '.jpg')
+                        ext = ext_map.get(content_type.split(';')[0].strip(), '.png')
+                        # 也根据URL扩展名推断（QQ CDN 有时 Content-Type 不准）
+                        url_lower = try_url.lower()
+                        if url_lower.endswith('.gif'):
+                            ext = '.gif'
+                        elif url_lower.endswith('.jpg') or url_lower.endswith('.jpeg'):
+                            ext = '.jpg'
+                        elif url_lower.endswith('.webp'):
+                            ext = '.webp'
                         # 原始下载文件
                         raw_dest = os.path.join(self.temp_dir, f"download_{timestamp}{ext}")
                         with open(raw_dest, 'wb') as f:
@@ -443,8 +717,8 @@ class MemePlugin(Star):
                     last_error = str(e)
                     continue
             if last_error and "404" in str(last_error):
-                return None, "该表情无公开下载地址，请用普通图片或 [呵呵] 等商城表情"
-            return None, f"下载失败: {last_error}"
+                return None, "该商城表情暂不支持下载，请尝试其他表情或使用普通图片"
+            return None, f"下载表情失败: {last_error}"
 
         return None, "图片组件缺少 file 或 url 属性，无法获取图片"
 
@@ -514,7 +788,8 @@ class MemePlugin(Star):
         :param force_ext: 强制输出文件扩展名（例如 ".gif"）
         :param kwargs: 额外参数，用于构造输出文件名
         """
-        target_image = self._extract_image_from_event(event)
+        event.stop_event()
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
             yield event.plain_result("牛魔，你引用的图呢？")
             return
@@ -536,10 +811,10 @@ class MemePlugin(Star):
         file_size = os.path.getsize(safe_file_path)
         logger.debug(f"文件大小: {file_size} 字节")
 
-        # 动图验证
+        # 动图验证（GIF 或 APNG 均可）
         if need_animated:
             if not image_utils.is_animated_gif(safe_file_path):
-                yield event.plain_result("请提供一个有效的 GIF 动图")
+                yield event.plain_result("请提供一个有效的动图（GIF 或 APNG）")
                 return
 
         # 清理过期临时文件（仅清理原始下载文件，不影响安全副本）
@@ -580,49 +855,14 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(左对称)(?:\s|$)')
     async def left_symmetric(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"left_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.apply_symmetry_to_static, safe_file_path, output_path, 'left')
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("获取头像失败，请重试")
-                        else:
-                            yield event.plain_result("获取头像失败，请引用一张图片")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("获取头像失败，请引用一张图片")
-            else:
-                yield event.plain_result("无法获取用户信息，请引用一张图片")
+            async for ret in self._process_avatar_command(
+                event,
+                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'left'),
+                "left"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -637,49 +877,14 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(右对称)(?:\s|$)')
     async def right_symmetric(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"right_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.apply_symmetry_to_static, safe_file_path, output_path, 'right')
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("获取头像失败，请重试")
-                        else:
-                            yield event.plain_result("获取头像失败，请引用一张图片")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("获取头像失败，请引用一张图片")
-            else:
-                yield event.plain_result("无法获取用户信息，请引用一张图片")
+            async for ret in self._process_avatar_command(
+                event,
+                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'right'),
+                "right"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -694,49 +899,14 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(上对称)(?:\s|$)')
     async def top_symmetric(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"top_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.apply_symmetry_to_static, safe_file_path, output_path, 'top')
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("获取头像失败，请重试")
-                        else:
-                            yield event.plain_result("获取头像失败，请引用一张图片")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("获取头像失败，请引用一张图片")
-            else:
-                yield event.plain_result("无法获取用户信息，请引用一张图片")
+            async for ret in self._process_avatar_command(
+                event,
+                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'top'),
+                "top"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -751,49 +921,14 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(下对称)(?:\s|$)')
     async def bottom_symmetric(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"bottom_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.apply_symmetry_to_static, safe_file_path, output_path, 'bottom')
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("获取头像失败，请重试")
-                        else:
-                            yield event.plain_result("获取头像失败，请引用一张图片")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("获取头像失败，请引用一张图片")
-            else:
-                yield event.plain_result("无法获取用户信息，请引用一张图片")
+            async for ret in self._process_avatar_command(
+                event,
+                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'bottom'),
+                "bottom"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -808,6 +943,7 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(奶龙)(?:\s|$|\d)?')
     async def send_meme(self, event: AstrMessageEvent):
+        event.stop_event()
         if not self.meme_list:
             yield event.plain_result("暂时还没有表情包，快往 resources 文件夹里放一些图片吧~")
             return
@@ -831,6 +967,7 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(变速)(?:\s|$|\d)')
     async def speed_gif(self, event: AstrMessageEvent):
+        event.stop_event()
         message_str = event.message_str.strip()
         speed_match = re.search(r'变速\s*(\d+(?:\.\d+)?)', message_str)
         if not speed_match:
@@ -867,50 +1004,14 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(反色)(?:\s|$)')
     async def invert_image(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            ext = ".png"
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}{ext}")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"invert_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.invert_image, safe_file_path, output_path)
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像反色时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("获取头像失败，请重试")
-                        else:
-                            yield event.plain_result("牛魔，你引用的图呢？")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("牛魔，你引用的图呢？")
-            else:
-                yield event.plain_result("牛魔，你引用的图呢？")
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.invert_image,
+                "invert"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -926,67 +1027,35 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(旋转)(?:\s|$)')
     async def rotate_image(self, event: AstrMessageEvent):
         """旋转图片，支持自定义角度，默认顺时针90°"""
+        event.stop_event()
         message_str = event.message_str.strip()
         
-        # 解析角度
-        angle_match = re.search(r'(\d+(?:\.\d+)?)', message_str)
+        # 剔除 @mention，避免 QQ 号被误识别为角度
+        clean_msg = re.sub(r'@\S+', '', message_str)
+        
+        # 解析角度：仅匹配紧邻"旋转"的数字（旋转180 / 旋转 90）
+        angle_match = re.search(r'旋转\s*(\d+(?:\.\d+)?)', clean_msg)
         if angle_match:
             angle_str = angle_match.group(1)
-            # 检查是否为整数
             if '.' in angle_str:
                 yield event.plain_result("我不会")
                 return
             angle = int(angle_str)
-            # 检查是否在0-360之间
             if angle < 0 or angle > 360:
                 yield event.plain_result("我不会")
                 return
         else:
-            angle = 90  # 默认顺时针90°
+            angle = 90
         
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"rotate_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.rotate_image, safe_file_path, output_path, angle)
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像旋转时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("牛魔，你引用的图呢？")
-                        else:
-                            yield event.plain_result("牛魔，你引用的图呢？")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("牛魔，你引用的图呢？")
-            else:
-                yield event.plain_result("牛魔，你引用的图呢？")
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.rotate_image,
+                "rotate",
+                angle,
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -1003,49 +1072,14 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(镜像)(?:\s|$)')
     async def mirror_image_cmd(self, event: AstrMessageEvent):
         """对图片进行水平镜像翻转"""
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"mirror_{timestamp_out}.png")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.mirror_image, safe_file_path, output_path)
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像镜像时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("牛魔，你引用的图呢？")
-                        else:
-                            yield event.plain_result("牛魔，你引用的图呢？")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("牛魔，你引用的图呢？")
-            else:
-                yield event.plain_result("牛魔，你引用的图呢？")
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.mirror_image,
+                "mirror"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -1061,49 +1095,14 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(左右平移)(?:\s|$)')
     async def shuffle_image_cmd(self, event: AstrMessageEvent):
         """对图片进行左右平移处理，图像从左往右再往左来回往复移动，共30帧"""
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"shuffle_{timestamp_out}.gif")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.shuffle_image, safe_file_path, output_path)
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像左右平移时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("牛魔，你引用的图呢？")
-                        else:
-                            yield event.plain_result("牛魔，你引用的图呢？")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("牛魔，你引用的图呢？")
-            else:
-                yield event.plain_result("牛魔，你引用的图呢？")
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.shuffle_image,
+                "shuffle"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -1113,7 +1112,7 @@ class MemePlugin(Star):
                              else image_utils.shuffle_image(inp, out),
             need_animated=False,
             cmd="shuffle",
-            force_ext=".gif"  # 强制输出为 GIF 格式
+            force_ext=".gif"
         ):
             yield ret
 
@@ -1121,49 +1120,14 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(左右横跳)(?:\s|$)')
     async def bounce_image_cmd(self, event: AstrMessageEvent):
         """对图片进行左右横跳处理，图像左右振动，共12帧"""
-        target_image = self._extract_image_from_event(event)
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
-            user_id = self._get_user_id_from_event(event)
-            if user_id:
-                avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-                try:
-                    async with self.session.get(avatar_url) as resp:
-                        if resp.status == 200:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            safe_file_path = os.path.join(self.temp_dir, f"avatar_{timestamp}.png")
-                            with open(safe_file_path, 'wb') as f:
-                                f.write(await resp.read())
-                            if os.path.exists(safe_file_path) and os.path.getsize(safe_file_path) > 0:
-                                timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                output_path = os.path.join(self.temp_dir, f"bounce_{timestamp_out}.gif")
-                                try:
-                                    async with self.processing_semaphore:
-                                        await asyncio.to_thread(image_utils.bounce_image, safe_file_path, output_path)
-                                        if os.path.exists(output_path):
-                                            img_seg = Image.fromFileSystem(output_path)
-                                            yield event.chain_result([img_seg])
-                                        else:
-                                            yield event.plain_result("处理失败，输出文件未生成")
-                                except Exception as e:
-                                    logger.error(f"处理头像左右横跳时出错: {e}", exc_info=True)
-                                    yield event.plain_result(f"处理失败：{str(e)}")
-                                finally:
-                                    if os.path.exists(safe_file_path):
-                                        os.remove(safe_file_path)
-                                    if os.path.exists(output_path):
-                                        try:
-                                            os.remove(output_path)
-                                        except:
-                                            pass
-                            else:
-                                yield event.plain_result("牛魔，你引用的图呢？")
-                        else:
-                            yield event.plain_result("牛魔，你引用的图呢？")
-                except Exception as e:
-                    logger.error(f"下载头像失败: {e}")
-                    yield event.plain_result("牛魔，你引用的图呢？")
-            else:
-                yield event.plain_result("牛魔，你引用的图呢？")
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.bounce_image,
+                "bounce"
+            ):
+                yield ret
             return
 
         async for ret in self._process_image_command(
@@ -1173,12 +1137,89 @@ class MemePlugin(Star):
                              else image_utils.bounce_image(inp, out),
             need_animated=False,
             cmd="bounce",
-            force_ext=".gif"  # 强制输出为 GIF 格式
+            force_ext=".gif"
         ):
             yield ret
+
+    @filter.regex(r'(?:\s|^)(万花镜)(?:\s|$)')
+    async def kaleidoscope_cmd(self, event: AstrMessageEvent):
+        """万花镜：将图片处理为万花镜样式（八方向×五层放射铺排）。
+        将原图等比缩小，沿八个方向（上/右上/右/右下/下/左下/左/左上）各向外铺开 5 张
+        （共 40 张），图像由内到外逐层增大、允许部分重叠、外侧大图覆盖内侧小图，
+        每张按所在方向对应的角度旋转，其余区域用透明填充。
+        引用图片时处理引用图，未引用时默认处理目标用户头像（优先@用户，其次发言者）"""
+        target_image = await self._extract_image_from_event(event)
+        if not target_image:
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.kaleidoscope_image,
+                "kaleidoscope"
+            ):
+                yield ret
+            return
+
+        async for ret in self._process_image_command(
+            event,
+            lambda inp, out: image_utils.kaleidoscope_gif(inp, out)
+                             if image_utils.is_gif(inp)
+                             else image_utils.kaleidoscope_image(inp, out),
+            need_animated=False,
+            cmd="kaleidoscope"
+        ):
+            yield ret
+
+    @filter.regex(r'(?:\s|^)(?:(\d{1,2})\s*)?(万花筒)(?:\s*(\d{1,2}))?(?:\s|$)')
+    async def tube_cmd(self, event: AstrMessageEvent):
+        """万花筒：将图片处理为万花筒样式（圆形扇区镜像）。
+        支持 6-24 的偶数面镜子：万花筒12 / 16万花筒 / 8万花筒 等，默认12面。
+        引用图片时处理引用图，未引用时默认处理目标用户头像（优先@用户，其次发言者）"""
+        message_str = event.message_str.strip()
+
+        # 解析面数：从消息中提取数字（支持6-24的偶数）
+        match = re.search(r'(?:^|\s)(\d{1,2})\s*万花筒|万花筒\s*(\d{1,2})(?:\s|$)', message_str)
+        segments = 12  # 默认12面
+        if match:
+            num_str = match.group(1) or match.group(2)
+            num = int(num_str)
+            if 6 <= num <= 24:
+                if num % 2 == 0:
+                    segments = num
+                else:
+                    yield event.plain_result(f"❌ 万花筒仅支持偶数面（6-24），不支持奇数 {num} 哦～")
+                    return
+            else:
+                yield event.plain_result(f"❌ 万花筒面数仅支持 6-24 范围，{num} 不在范围内～")
+                return
+
+        target_image = await self._extract_image_from_event(event)
+        if not target_image:
+            async for ret in self._process_avatar_command(
+                event,
+                image_utils.tube_image,
+                "tube",
+                segments,
+            ):
+                yield ret
+            return
+
+        async for ret in self._process_image_command(
+            event,
+            lambda inp, out, seg=segments: image_utils.tube_gif(inp, out, segments=seg)
+                             if image_utils.is_gif(inp)
+                             else image_utils.tube_image(inp, out, segments=seg),
+            need_animated=False,
+            cmd="tube"
+        ):
+            yield ret
+
     @filter.regex(r'(?:\s|^)(添加)(?:\s|$)')
     async def add_meme(self, event: AstrMessageEvent):
-        target_image = self._extract_image_from_event(event)
+        # 权限检查：仅允许主人（2406873379）使用
+        if str(event.get_sender_id()) != "2406873379":
+            yield event.plain_result("❌ 你没有权限使用此命令哦~只有主人才能添加表情包！")
+            return
+        event.stop_event()
+        target_image = await self._extract_image_from_event(event)
         if not target_image:
             yield event.plain_result("请发送一张图片，或引用一张包含图片的消息。\n使用方法：/添加 [图片]")
             return

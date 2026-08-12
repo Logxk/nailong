@@ -914,7 +914,7 @@ class MemePlugin(Star):
             return
         event.stop_event()
         if not self.meme_list:
-            yield event.plain_result("暂时还没有表情包，快往 resources 文件夹里放一些图片吧~")
+            yield event.plain_result("暂时还没有表情包，请到 GitHub Releases 下载 nailong_resources.zip 并解压到插件目录~")
             return
         message_str = event.message_str.strip()
         count = 1

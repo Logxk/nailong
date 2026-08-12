@@ -47,7 +47,12 @@
    ```bash
    pip install -r requirements.txt
    ```
-3. 重启 AstrBot。
+3. **下载奶龙表情包资源**（推荐）：
+   由于 AstrBot 插件存在 **16MB 大小限制**，本仓库**不内置**表情包资源。请到
+   [Releases](https://github.com/Logxk/nailong/releases) 下载 `nailong_resources.zip`，
+   解压后把 `resources` 文件夹放入插件目录即可；插件首次运行时会自动将其迁移到数据目录
+   （`data/plugin_data/astrbot_plugin_nailong/nailong_resources/`）。
+4. 重启 AstrBot。
 
 ## ⚙️ 配置
 
@@ -55,6 +60,9 @@
 
 - `nailong_resources/`：存放你的奶龙表情包（放入图片即可）
 - `nailong_temp/`：存放临时处理文件（每小时自动清理超时文件）
+
+> 提示：初始表情包资源需要从 [Releases](https://github.com/Logxk/nailong/releases) 下载
+> `nailong_resources.zip` 解压后放入，插件不会自动下载。
 
 可选环境变量：
 
@@ -93,7 +101,7 @@
 
 ## ⚠️ 注意事项
 
-- 确保 `nailong_resources` 文件夹中有至少一张图片，否则 `/奶龙` 会提示"暂时还没有表情包"。
+- 首次使用请先从 [Releases](https://github.com/Logxk/nailong/releases) 下载 `nailong_resources.zip` 并解压，确保 `nailong_resources` 文件夹中有至少一张图片，否则 `/奶龙` 会提示"暂时还没有表情包"。
 - 一次最多发送 10 张表情包，防止刷屏。
 - GIF 处理需要保证文件为有效的动图格式，静态 GIF 图片无法进行变速/倒放操作。
 - 若图片文件无法本地读取，插件会尝试从 URL 下载（需网络连通）。

@@ -56,13 +56,19 @@
 
 ## ⚙️ 配置
 
-无需额外配置。插件首次运行时会在 AstrBot 数据目录（`data/plugin_data/astrbot_plugin_nailong/`）自动创建两个文件夹：
+无需额外配置。插件首次运行时会在 AstrBot 数据目录自动创建两个文件夹：
 
 - `nailong_resources/`：存放你的奶龙表情包（放入图片即可）
 - `nailong_temp/`：存放临时处理文件（每小时自动清理超时文件）
 
-> 提示：初始表情包资源需要从 [Releases](https://github.com/Logxk/nailong/releases) 下载
-> `nailong_resources.zip` 解压后放入，插件不会自动下载。
+> **数据目录说明**：数据目录位于 `data/plugin_data/astrbot_plugin_nailong/`。
+> 其中 `astrbot_plugin_nailong` 由 `metadata.yaml` 的 `name` 字段决定，**与插件所在文件夹名
+> （即 git clone 后的仓库目录名，如 `nailong`）无关**，请以实际目录名为准。
+
+> **初始资源获取**：初始表情包资源需要从 [Releases](https://github.com/Logxk/nailong/releases)
+> 下载 `nailong_resources.zip` 解压后放入，插件不会自动下载。两种放置方式任选其一：
+> 1. 将解压出的 `resources` 文件夹放入插件目录，插件首次运行会自动迁移到数据目录；
+> 2. 或直接将解压出的图片放入 `data/plugin_data/astrbot_plugin_nailong/nailong_resources/`。
 
 可选环境变量：
 

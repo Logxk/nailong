@@ -45,7 +45,7 @@
    ```
 2. 安装依赖（插件会自动检测，若缺少请手动安装）：
    ```bash
-   pip install Pillow aiohttp
+   pip install -r requirements.txt
    ```
 3. 重启 AstrBot。
 

@@ -1,22 +1,21 @@
 import os
 import random
 import re
+import math
 import shutil
 import asyncio
 from datetime import datetime
-from pathlib import Path
-from typing import Optional, Tuple, List, Callable, Any
+from typing import Optional, Tuple, Callable
 
 import aiohttp
-from PIL import Image as PILImage
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api.message_components import Image, Reply, Face
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.message_components import Image, Reply, Face, Plain
 try:
     from astrbot.api.message_components import MFace
 except ImportError:
     MFace = None  # MFace 在新版 astrbot 中已移除
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 
 # 导入图像处理模块
 from . import image_utils
@@ -24,23 +23,14 @@ from . import image_utils
 # ===== 本地 QQ 表情资源目录配置 =====
 # 处理 [表情:123] 等系统表情时，优先直接读取本机 QQ 客户端缓存的
 # sysface_res 目录下的 s{id}.png 文件，避免 CDN 下载、离线可用且速度更快。
-# 插件通常运行在 WSL Ubuntu 中，Windows E 盘通过 /mnt/e/ 访问；
-# 也可通过环境变量 NAILONG_LOCAL_FACE_DIR 自定义目录。
+# 通过环境变量 NAILONG_LOCAL_FACE_DIR 自定义目录（可选）。
 _LOCAL_FACE_DIR_ENV = "NAILONG_LOCAL_FACE_DIR"
-_LOCAL_FACE_DIRS = [
-    # WSL 下 Windows E 盘的挂载路径
-    "/mnt/e/新建文件夹 (2)/nt_qq/global/nt_data/Emoji/emoji-resource/sysface_res/apng",
-    # Windows 原生路径（正斜杠 / 反斜杠两种写法）
-    "E:/新建文件夹 (2)/nt_qq/global/nt_data/Emoji/emoji-resource/sysface_res/apng",
-    r"E:\新建文件夹 (2)\nt_qq\global\nt_data\Emoji\emoji-resource\sysface_res\apng",
-]
 # 本地表情文件可能的扩展名（目录名为 apng，实际文件为 png）
 _LOCAL_FACE_EXTS = (".png", ".apng", ".gif")
 
-@register("astrbot_plugin_nailong", "Logxk", "一个发送奶龙表情包的插件", "1.0.0")
 class MemePlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
+    def __init__(self, context: Context, config: AstrBotConfig = None):
+        super().__init__(context, config)
         self.plugin_dir = os.path.dirname(__file__)
         self.old_meme_dir = os.path.join(self.plugin_dir, "resources")
         data_dir = StarTools.get_data_dir()
@@ -51,7 +41,11 @@ class MemePlugin(Star):
         self.meme_list = self._scan_memes()
 
         # 并发控制
-        max_concurrent = int(os.getenv("NAILONG_MAX_CONCURRENT", 2))
+        try:
+            max_concurrent = int(os.getenv("NAILONG_MAX_CONCURRENT", 2))
+        except (ValueError, TypeError):
+            max_concurrent = 2
+        max_concurrent = max(1, min(max_concurrent, 10))
         self.processing_semaphore = asyncio.Semaphore(max_concurrent)
         logger.info(f"并发限流已启用，最大同时处理数: {max_concurrent}")
 
@@ -62,8 +56,12 @@ class MemePlugin(Star):
             trust_env=False,  # 忽略 HTTP_PROXY/HTTPS_PROXY 环境变量
         )
 
-        # 后台清理任务
-        self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        # 后台清理任务在 initialize() 中启动
+
+    async def initialize(self):
+        """插件初始化完成后的异步初始化"""
+        if not hasattr(self, 'cleanup_task'):
+            self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
 
     def _ensure_dirs(self):
         os.makedirs(self.meme_dir, exist_ok=True)
@@ -93,25 +91,30 @@ class MemePlugin(Star):
         return meme_files
 
     def _clean_temp_files(self, max_age_hours=1):
-        """清理超过指定时间的临时文件（仅清理特定前缀的文件，避免误删处理中的文件）"""
-        try:
-            now = datetime.now().timestamp()
-            for file in os.listdir(self.temp_dir):
-                file_path = os.path.join(self.temp_dir, file)
+        """清理临时目录中超过指定时间的文件，避免处理输出文件无限累积
+
+        所有临时文件（原始下载、安全副本、处理输出）在生成 1 小时后均可安全删除，
+        处理中的文件生命周期仅数秒，不存在误删风险。
+        """
+        now = datetime.now().timestamp()
+        for file in os.listdir(self.temp_dir):
+            file_path = os.path.join(self.temp_dir, file)
+            try:
                 if os.path.isfile(file_path):
-                    # 只清理以 local_ 或 download_ 开头的文件（即原始下载文件）
-                    if file.startswith(('local_', 'download_')):
-                        if now - os.path.getmtime(file_path) > max_age_hours * 3600:
-                            os.remove(file_path)
-                            logger.debug(f"清理临时文件: {file}")
-        except Exception as e:
-            logger.error(f"清理临时文件时出错: {e}")
+                    if now - os.path.getmtime(file_path) > max_age_hours * 3600:
+                        os.remove(file_path)
+                        logger.debug(f"清理临时文件: {file}")
+            except Exception as e:
+                logger.error(f"清理临时文件 {file} 时出错: {e}")
 
     async def _periodic_cleanup(self):
         try:
             while True:
                 await asyncio.sleep(3600)
-                self._clean_temp_files()
+                try:
+                    self._clean_temp_files()
+                except Exception as e:
+                    logger.error(f"定期清理临时文件时出错: {e}")
         except asyncio.CancelledError:
             logger.info("后台清理任务被取消")
             raise
@@ -126,13 +129,21 @@ class MemePlugin(Star):
                     return str(qq)
         return None
 
+    def _require_wake_command(self, event: AstrMessageEvent) -> bool:
+        """仅当消息是显式指令（以唤醒前缀开头 / 被 @ / 私聊）时才响应。
+
+        防止正则匹配到日常聊天中的普通词汇（如"旋转""镜像""添加"）时
+        误触发并劫持事件。
+        """
+        return bool(getattr(event, 'is_at_or_wake_command', False))
+
     async def _download_avatar(self, qq: str) -> Optional[str]:
         """下载指定 QQ 号的头像到临时目录，返回文件路径"""
         avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=640"
         try:
             async with self.session.get(avatar_url) as resp:
                 if resp.status == 200:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     dest = os.path.join(self.temp_dir, f"avatar_{qq}_{timestamp}.png")
                     with open(dest, 'wb') as f:
                         f.write(await resp.read())
@@ -141,6 +152,39 @@ class MemePlugin(Star):
         except Exception as e:
             logger.error(f"下载头像失败 (qq={qq}): {e}")
         return None
+
+    async def _process_avatar_for(
+        self,
+        event: AstrMessageEvent,
+        avatar_path: str,
+        handler: Callable,
+        output_prefix: str,
+        *handler_args,
+    ):
+        """对已下载的头像文件执行 handler 并产出处理结果（结束后清理临时文件）。
+        handler 签名为 (input_path, output_path, *handler_args)"""
+        output_path = None
+        try:
+            timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            output_path = os.path.join(self.temp_dir, f"{output_prefix}_{timestamp_out}.png")
+            async with self.processing_semaphore:
+                await asyncio.to_thread(handler, avatar_path, output_path, *handler_args)
+                if os.path.exists(output_path):
+                    img_seg = Image.fromFileSystem(output_path)
+                    yield event.chain_result([img_seg])
+                else:
+                    yield event.plain_result("❌ 处理失败，输出文件未生成")
+        except Exception as e:
+            logger.error(f"处理头像时出错: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 处理失败：{str(e)}")
+        finally:
+            if avatar_path and os.path.exists(avatar_path):
+                os.remove(avatar_path)
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
 
     async def _process_avatar_command(
         self,
@@ -157,27 +201,10 @@ class MemePlugin(Star):
         if mentioned_qq:
             avatar_path = await self._download_avatar(mentioned_qq)
             if avatar_path:
-                try:
-                    timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    output_path = os.path.join(self.temp_dir, f"{output_prefix}_{timestamp_out}.png")
-                    async with self.processing_semaphore:
-                        await asyncio.to_thread(handler, avatar_path, output_path, *handler_args)
-                        if os.path.exists(output_path):
-                            img_seg = Image.fromFileSystem(output_path)
-                            yield event.chain_result([img_seg])
-                        else:
-                            yield event.plain_result("❌ 处理失败，输出文件未生成")
-                except Exception as e:
-                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                    yield event.plain_result(f"❌ 处理失败：{str(e)}")
-                finally:
-                    if os.path.exists(avatar_path):
-                        os.remove(avatar_path)
-                    if os.path.exists(output_path):
-                        try:
-                            os.remove(output_path)
-                        except:
-                            pass
+                async for ret in self._process_avatar_for(
+                    event, avatar_path, handler, output_prefix, *handler_args
+                ):
+                    yield ret
                 return
 
         # 其次：发言者自己的头像
@@ -185,27 +212,10 @@ class MemePlugin(Star):
         if user_id:
             avatar_path = await self._download_avatar(user_id)
             if avatar_path:
-                try:
-                    timestamp_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    output_path = os.path.join(self.temp_dir, f"{output_prefix}_{timestamp_out}.png")
-                    async with self.processing_semaphore:
-                        await asyncio.to_thread(handler, avatar_path, output_path, *handler_args)
-                        if os.path.exists(output_path):
-                            img_seg = Image.fromFileSystem(output_path)
-                            yield event.chain_result([img_seg])
-                        else:
-                            yield event.plain_result("❌ 处理失败，输出文件未生成")
-                except Exception as e:
-                    logger.error(f"处理头像时出错: {e}", exc_info=True)
-                    yield event.plain_result(f"❌ 处理失败：{str(e)}")
-                finally:
-                    if os.path.exists(avatar_path):
-                        os.remove(avatar_path)
-                    if os.path.exists(output_path):
-                        try:
-                            os.remove(output_path)
-                        except:
-                            pass
+                async for ret in self._process_avatar_for(
+                    event, avatar_path, handler, output_prefix, *handler_args
+                ):
+                    yield ret
                 return
 
         # 兜底：要求引用图片
@@ -223,15 +233,15 @@ class MemePlugin(Star):
         result = self._extract_image_from_event_sync(event)
         if result is not None:
             return result
-        
+
         # 最后尝试：通过 OneBot API 获取被引用消息中的 mface
         return await self._resolve_mface_from_reply(event)
-    
+
     def _extract_image_from_event_sync(self, event: AstrMessageEvent) -> Optional[Image]:
         """同步提取：消息链 + raw_message（不含 API 调用）"""
         face_id = None
         face_url = None
-        
+
         # 第一步：遍历已解析的消息链
         for seg in event.message_obj.message:
             if isinstance(seg, Reply) and seg.chain:
@@ -261,7 +271,7 @@ class MemePlugin(Star):
                         face_id = int(mface_id)
                     except (ValueError, TypeError):
                         pass
-        
+
         # 第二步：从 raw_message 中提取被框架过滤掉的 mface（商城表情包）
         raw_mface_url, raw_mface_id = self._extract_mface_from_raw(event)
         if not face_url:
@@ -269,19 +279,19 @@ class MemePlugin(Star):
         # raw_message 中的 face_id 优先（因为包含商城表情 ID）
         if raw_mface_id is not None:
             face_id = raw_mface_id
-        
+
         # 处理 mface（QQ商城表情包）：URL 优先，face_id 作回退
         if face_url and face_id is not None:
             # 同时有 URL 和 face_id：URL 优先，face_id URL 作回退
             fallback_urls = self._get_qq_face_urls(face_id)
             logger.info(f"mface 商城表情: id={face_id}, 主URL={face_url[:80]}, 回退URL数={len(fallback_urls)}")
             return self._make_image_from_url(face_url, fallback_urls=fallback_urls)
-        
+
         if face_url:
             # 仅有 URL，无 face_id
             logger.info(f"mface 仅有URL, 无face_id: {face_url[:80]}")
             return self._make_image_from_url(face_url)
-        
+
         # 处理 Face（QQ黄脸/互动表情/商城表情通过 face_id）
         if face_id is not None:
             # 优先使用本地表情文件（QQ 客户端缓存的 sysface_res），避免 CDN 下载
@@ -300,7 +310,7 @@ class MemePlugin(Star):
             return local_img
 
         return None
-    
+
     async def _resolve_mface_from_reply(self, event: AstrMessageEvent) -> Optional[Image]:
         """通过 OneBot get_msg API 获取被引用消息中的 mface（商城表情）
         
@@ -312,7 +322,7 @@ class MemePlugin(Star):
         if not reply_id:
             logger.debug("无法提取 reply message_id，跳过 API 查询")
             return None
-        
+
         # 2. 调用 OneBot get_msg API
         try:
             bot = getattr(event, 'bot', None)
@@ -321,17 +331,17 @@ class MemePlugin(Star):
             if not callable(call_action):
                 logger.debug("无法获取 OneBot call_action，跳过 API 查询")
                 return None
-            
+
             logger.info(f"尝试通过 get_msg API 获取被引用消息: message_id={reply_id}")
             result = await call_action('get_msg', message_id=str(reply_id))
         except Exception as e:
             logger.warning(f"调用 get_msg API 失败: {e}")
             return None
-        
+
         if not isinstance(result, dict):
             logger.debug(f"get_msg 返回非 dict 类型: {type(result)}")
             return None
-        
+
         # 3. 解析响应中的 message 数组，查找 mface
         data = result.get('data', result)  # get_msg 响应通常在 data 字段中
         if isinstance(data, dict):
@@ -341,19 +351,19 @@ class MemePlugin(Star):
         else:
             logger.debug(f"get_msg 响应格式未知: {type(result)}")
             return None
-        
+
         if not message_array:
             logger.debug("get_msg 响应中无 message 数组")
             return None
-        
+
         # 4. 在消息段中搜索 mface
         url, face_id = self._search_mface_in_segments(message_array)
         if url is None and face_id is None:
             logger.debug("get_msg 响应中未找到 mface 段")
             return None
-        
+
         logger.info(f"通过 get_msg API 找到商城表情: id={face_id}, url={url[:80] if url else '无'}")
-        
+
         # 5. 构造 Image（与 sync 方法相同的逻辑）
         if url and face_id is not None:
             fallback_urls = self._get_qq_face_urls(face_id)
@@ -364,9 +374,9 @@ class MemePlugin(Star):
             qq_face_urls = self._get_qq_face_urls(face_id)
             if qq_face_urls:
                 return self._make_image_from_url(qq_face_urls[0], fallback_urls=qq_face_urls[1:])
-        
+
         return None
-    
+
     def _get_reply_message_id(self, event: AstrMessageEvent) -> Optional[str]:
         """从事件中提取 reply 的 message_id"""
         # 方式1：从已解析的 Reply 组件中获取
@@ -375,7 +385,7 @@ class MemePlugin(Star):
                 reply_id = getattr(seg, 'id', None)
                 if reply_id:
                     return str(reply_id)
-        
+
         # 方式2：从 raw_message 的 reply 段中获取
         raw = getattr(event.message_obj, 'raw_message', None)
         if raw:
@@ -388,9 +398,9 @@ class MemePlugin(Star):
                         reply_id = seg_data.get('id', None) if isinstance(seg_data, dict) else None
                         if reply_id:
                             return str(reply_id)
-        
+
         return None
-    
+
     def _extract_mface_from_raw(self, event: AstrMessageEvent) -> Tuple[Optional[str], Optional[int]]:
         """从 raw_message 中提取 mface 的 URL 和 face_id（包括被框架忽略的段和额外数据）
         
@@ -403,15 +413,15 @@ class MemePlugin(Star):
         if not raw:
             logger.debug("raw_message 为空，无法提取 mface")
             return None, None
-        
+
         message_array = getattr(raw, 'message', None) or getattr(raw, 'message_list', None)
         if not message_array:
             # 记录 raw 的类型和属性用于调试
             logger.debug(f"raw_message 无 message/message_list 字段, type={type(raw).__name__}, attrs={[a for a in dir(raw) if not a.startswith('_')]}")
             return None, None
-        
+
         return self._search_mface_in_segments(message_array)
-    
+
     def _search_mface_in_segments(self, segments: list) -> Tuple[Optional[str], Optional[int]]:
         """递归搜索消息段列表中的 mface/face 数据
         
@@ -421,14 +431,14 @@ class MemePlugin(Star):
         """
         if not segments:
             return None, None
-        
+
         for msg_seg in segments:
             seg_data = msg_seg.get('data', {}) if isinstance(msg_seg, dict) else getattr(msg_seg, 'data', {})
             seg_type = msg_seg.get('type', '') if isinstance(msg_seg, dict) else getattr(msg_seg, 'type', '')
-            
+
             if not isinstance(seg_data, dict):
                 seg_data = getattr(msg_seg, '__dict__', {}) if hasattr(msg_seg, '__dict__') else {}
-            
+
             # mface（QQ商城表情）：提取 url 和 id
             if seg_type == 'mface':
                 url = seg_data.get('url', '')
@@ -441,7 +451,7 @@ class MemePlugin(Star):
                         face_id = None
                 logger.info(f"从 raw_message 提取到 mface: id={face_id}, url={url[:80] if url else '无'}")
                 return url if url else None, face_id
-            
+
             # face 段可能附带 url（LLBot 等实现）
             if seg_type == 'face':
                 if 'url' in seg_data and seg_data['url']:
@@ -456,7 +466,7 @@ class MemePlugin(Star):
                     return url, face_id
                 # 记录 face 段完整数据用于调试
                 logger.debug(f"raw_message face 段数据: {seg_data}")
-            
+
             # reply 段：递归搜索嵌套的原始消息内容（引用商城表情后发命令的场景）
             if seg_type == 'reply':
                 # 不同 OneBot 实现可能使用不同的字段名嵌套原始消息
@@ -470,7 +480,7 @@ class MemePlugin(Star):
                     url, face_id = self._search_mface_in_segments(nested_msg)
                     if url is not None or face_id is not None:
                         return url, face_id
-        
+
         return None, None
 
     def _get_local_face_dir(self) -> Optional[str]:
@@ -478,9 +488,6 @@ class MemePlugin(Star):
         env_dir = os.getenv(_LOCAL_FACE_DIR_ENV, "").strip()
         if env_dir and os.path.isdir(env_dir):
             return env_dir
-        for d in _LOCAL_FACE_DIRS:
-            if os.path.isdir(d):
-                return d
         return None
 
     def _get_local_face_path(self, face_id) -> Optional[str]:
@@ -532,26 +539,26 @@ class MemePlugin(Star):
         if face_id < 0:
             return []
         urls = []
-        
+
         # 经典黄脸表情 (0-246) 专用 CDN（GIF 格式）
         if face_id <= 246:
             urls.append(f"https://qzonestyle.gtimg.cn/qzone/em/e{face_id}.gif")
-        
+
         # QQ商城表情 / 大表情 通用 CDN（支持任意 ID）
         urls.append(f"https://gxh.vip.qq.com/emojigxh/show?id={face_id}")
-        
+
         # 大表情备用参数（>246 时尝试 t=1 参数）
         if face_id > 246:
             urls.append(f"https://gxh.vip.qq.com/emojigxh/show?id={face_id}&t=1")
-        
+
         # 旧版 CDN 回退
         if face_id <= 500:
             urls.append(f"https://face.qq.com/scripts/face/qqface/{face_id}.gif")
-        
+
         # 商城表情额外回退源
         if face_id > 246:
             urls.append(f"https://gxh.vip.qq.com/emojigxh/preview?id={face_id}")
-        
+
         return urls
 
 
@@ -574,43 +581,90 @@ class MemePlugin(Star):
 
     def _get_user_id_from_event(self, event: AstrMessageEvent) -> Optional[str]:
         """从事件对象中提取用户ID"""
-        user_id = None
-        
-        # 方式1: 从 session_id 提取 (格式: platform:user_id@...)
-        session_id = getattr(event, 'session_id', None)
-        if session_id:
-            session_str = str(session_id)
-            if ':' in session_str:
-                parts = session_str.split(':')
-                if len(parts) >= 2:
-                    user_id = parts[1].split('@')[0]
-        
+        # 方式1: 框架提供的发送者 ID
+        user_id = event.get_sender_id()
+        if user_id:
+            return user_id
+
         # 方式2: 直接 user_id 属性
-        if not user_id:
-            user_id = getattr(event, 'user_id', None)
-        
+        user_id = getattr(event, 'user_id', None)
+        if user_id:
+            return str(user_id)
+
         # 方式3: 从 message_obj.sender 获取
-        if not user_id:
-            try:
-                message_obj = getattr(event, 'message_obj', None)
-                if message_obj:
-                    sender = getattr(message_obj, 'sender', None)
-                    if sender:
-                        user_id = getattr(sender, 'user_id', None)
-            except:
-                pass
-        
+        try:
+            message_obj = getattr(event, 'message_obj', None)
+            if message_obj:
+                sender = getattr(message_obj, 'sender', None)
+                if sender:
+                    user_id = getattr(sender, 'user_id', None)
+                    if user_id:
+                        return str(user_id)
+        except Exception:
+            pass
+
         # 方式4: 从 message_obj 直接获取 user_id
-        if not user_id:
-            try:
-                message_obj = getattr(event, 'message_obj', None)
-                if message_obj:
-                    user_id = getattr(message_obj, 'user_id', None)
-            except:
-                pass
-        
-        logger.debug(f"获取用户ID - session_id: {getattr(event, 'session_id', 'N/A')}, user_id_attr: {getattr(event, 'user_id', 'N/A')}, result: {user_id}")
-        return user_id
+        try:
+            message_obj = getattr(event, 'message_obj', None)
+            if message_obj:
+                user_id = getattr(message_obj, 'user_id', None)
+                if user_id:
+                    return str(user_id)
+        except Exception:
+            pass
+
+        logger.debug(f"获取用户ID失败 - session_id: {event.session_id}")
+        return None
+
+    def _allowed_file_roots(self) -> list:
+        """返回允许读取本地图片的根目录集合，防止越权读取服务器任意文件。"""
+        data_dir = StarTools.get_data_dir()
+        return [
+            str(data_dir),          # 插件数据目录（含图片缓存 image/）
+            self.meme_dir,          # 表情资源目录
+            self.temp_dir,          # 临时目录
+        ]
+
+    def _is_allowed_local_path(self, path: str) -> bool:
+        """判断绝对路径是否位于允许的根目录内"""
+        try:
+            real = os.path.realpath(path)
+            for root in self._allowed_file_roots():
+                root_real = os.path.realpath(root)
+                if real == root_real or real.startswith(root_real + os.sep):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _local_image_candidates(self, raw_name: str) -> list:
+        """构造本地图片文件的候选路径列表（去重、过滤空值）。
+
+        仅接受插件数据目录内的绝对路径，避免读取服务器任意文件。
+        """
+        data_dir = StarTools.get_data_dir()
+        image_cache_dir = data_dir / "image"
+        safe_name = os.path.basename(raw_name)
+        candidates = []
+        if os.path.isabs(raw_name):
+            # 绝对路径仅在白名单目录内才接受
+            if self._is_allowed_local_path(raw_name):
+                candidates.append(raw_name)
+        else:
+            # 相对路径才拼接缓存目录
+            candidates.append(str(image_cache_dir / raw_name))
+        candidates += [
+            str(image_cache_dir / safe_name),
+            os.path.join(self.meme_dir, safe_name),
+        ]
+        # 过滤掉 None 并去重
+        seen = set()
+        unique_candidates = []
+        for p in candidates:
+            if p and p not in seen:
+                seen.add(p)
+                unique_candidates.append(p)
+        return unique_candidates
 
     async def _download_image_to_temp(self, image: Image) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -620,29 +674,12 @@ class MemePlugin(Star):
         # 优先处理本地文件（file 属性）
         if hasattr(image, 'file') and image.file:
             raw_name = image.file
-            safe_name = os.path.basename(raw_name)
-            # 候选路径列表（基于框架数据目录）
-            data_dir = StarTools.get_data_dir()
-            image_cache_dir = data_dir / "image"
-            candidates = [
-                raw_name if os.path.isabs(raw_name) else None,
-                str(image_cache_dir / raw_name),
-                str(image_cache_dir / safe_name),
-                os.path.join(self.meme_dir, safe_name),
-                safe_name,
-            ]
-            # 过滤掉 None 并去重
-            seen = set()
-            unique_candidates = []
-            for p in candidates:
-                if p and p not in seen:
-                    seen.add(p)
-                    unique_candidates.append(p)
+            unique_candidates = self._local_image_candidates(raw_name)
 
             for path in unique_candidates:
                 if path and os.path.exists(path):
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    ext = os.path.splitext(safe_name)[1]
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    ext = os.path.splitext(os.path.basename(raw_name))[1]
                     # 原始下载文件（可被清理）
                     raw_dest = os.path.join(self.temp_dir, f"local_{timestamp}{ext}")
                     try:
@@ -655,8 +692,10 @@ class MemePlugin(Star):
                         if safe_copy:
                             return safe_copy, None
                         else:
-                            # 若安全副本创建失败，删除原始文件并返回错误
-                            os.remove(raw_dest)
+                            try:
+                                os.remove(raw_dest)
+                            except Exception:
+                                pass
                             return None, "创建安全副本失败"
                     except Exception as e:
                         logger.error(f"复制本地文件失败 {path} -> {raw_dest}: {e}")
@@ -664,11 +703,11 @@ class MemePlugin(Star):
 
         # 处理网络图片（url 属性），支持 ||| 分隔的多URL回退
         if hasattr(image, 'url') and image.url:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
             # 支持 ||| 分隔的多URL回退
-            urls_to_try = image.url.split(self._URL_SEP) if hasattr(self, '_URL_SEP') else [image.url]
-            
+            urls_to_try = image.url.split(self._URL_SEP)
+
             last_error = None
             for try_url in urls_to_try:
                 try:
@@ -711,7 +750,10 @@ class MemePlugin(Star):
                         if safe_copy:
                             return safe_copy, None
                         else:
-                            os.remove(raw_dest)
+                            try:
+                                os.remove(raw_dest)
+                            except Exception:
+                                pass
                             return None, "创建安全副本失败"
                 except Exception as e:
                     last_error = str(e)
@@ -721,34 +763,6 @@ class MemePlugin(Star):
             return None, f"下载表情失败: {last_error}"
 
         return None, "图片组件缺少 file 或 url 属性，无法获取图片"
-
-
-    async def _download_qq_face(self, face_url: str) -> Tuple[Optional[str], Optional[str]]:
-        """下载QQ表情并保存到临时目录
-        
-        Args:
-            face_url: 表情图片URL
-            
-        Returns:
-            (保存路径, 错误信息)
-        """
-        if not face_url:
-            return None, "无效的表情URL"
-        
-        try:
-            output_file = os.path.join(self.temp_dir, f"qq_face_{hash(face_url) % 10000}.png")
-            
-            async with self.session.get(face_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    with open(output_file, 'wb') as f:
-                        f.write(await resp.read())
-                    return output_file, None
-                else:
-                    return None, f"下载失败: HTTP {resp.status}"
-        except asyncio.TimeoutError:
-            return None, "下载超时"
-        except Exception as e:
-            return None, f"下载错误: {str(e)}"
 
     def _create_safe_copy(self, src_path: str, prefix: str = "copy_") -> Optional[str]:
         """创建文件安全副本，返回副本路径，失败返回 None"""
@@ -777,6 +791,7 @@ class MemePlugin(Star):
         need_animated: bool = False,
         fail_msg: str = "处理失败",
         force_ext: Optional[str] = None,
+        prepend_msg: str = "",
         **kwargs
     ):
         """
@@ -786,6 +801,7 @@ class MemePlugin(Star):
         :param need_animated: 是否要求图片为动图
         :param fail_msg: 失败时的文本提示（仅当 handler 不抛出异常且返回 False 时使用，现异常机制下基本无用）
         :param force_ext: 强制输出文件扩展名（例如 ".gif"）
+        :param prepend_msg: 附加在结果图片之前的文本提示（与图片合并为一条消息）
         :param kwargs: 额外参数，用于构造输出文件名
         """
         event.stop_event()
@@ -820,7 +836,7 @@ class MemePlugin(Star):
         # 清理过期临时文件（仅清理原始下载文件，不影响安全副本）
         self._clean_temp_files()
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         if force_ext:
             ext = force_ext
         elif image_utils.is_gif(safe_file_path):
@@ -840,7 +856,10 @@ class MemePlugin(Star):
                 if not os.path.exists(output_path):
                     raise RuntimeError("处理完成但输出文件未生成")
                 img_seg = Image.fromFileSystem(output_path)
-                yield event.chain_result([img_seg])
+                if prepend_msg:
+                    yield event.chain_result([Plain(prepend_msg), img_seg])
+                else:
+                    yield event.chain_result([img_seg])
         except Exception as e:
             logger.error(f"处理图片时出错: {e}", exc_info=True)
             yield event.plain_result(f"❌ 处理失败：{str(e)}")
@@ -853,96 +872,46 @@ class MemePlugin(Star):
             except Exception as e:
                 logger.error(f"删除安全副本失败: {e}")
 
-    @filter.regex(r'(?:\s|^)(左对称)(?:\s|$)')
-    async def left_symmetric(self, event: AstrMessageEvent):
+    _SYMMETRY_KEYWORDS = {
+        '左对称': 'left',
+        '右对称': 'right',
+        '上对称': 'top',
+        '下对称': 'bottom',
+    }
+
+    @filter.regex(r'(?:\s|^)(左对称|右对称|上对称|下对称)(?:\s|$)')
+    async def symmetric(self, event: AstrMessageEvent):
+        if not self._require_wake_command(event):
+            return
+        m = re.search(r'(左对称|右对称|上对称|下对称)', event.message_str)
+        if not m:
+            return
+        direction = self._SYMMETRY_KEYWORDS[m.group(1)]
+
         target_image = await self._extract_image_from_event(event)
         if not target_image:
             async for ret in self._process_avatar_command(
                 event,
-                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'left'),
-                "left"
+                lambda inp, out, d=direction: image_utils.apply_symmetry_to_static(inp, out, d),
+                direction
             ):
                 yield ret
             return
 
         async for ret in self._process_image_command(
             event,
-            lambda inp, out: image_utils.apply_symmetry_to_gif(inp, out, 'left')
+            lambda inp, out, d=direction: image_utils.apply_symmetry_to_gif(inp, out, d)
                              if image_utils.is_gif(inp)
-                             else image_utils.apply_symmetry_to_static(inp, out, 'left'),
+                             else image_utils.apply_symmetry_to_static(inp, out, d),
             need_animated=False,
-            cmd="left"
+            cmd=direction
         ):
             yield ret
 
-    @filter.regex(r'(?:\s|^)(右对称)(?:\s|$)')
-    async def right_symmetric(self, event: AstrMessageEvent):
-        target_image = await self._extract_image_from_event(event)
-        if not target_image:
-            async for ret in self._process_avatar_command(
-                event,
-                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'right'),
-                "right"
-            ):
-                yield ret
-            return
-
-        async for ret in self._process_image_command(
-            event,
-            lambda inp, out: image_utils.apply_symmetry_to_gif(inp, out, 'right')
-                             if image_utils.is_gif(inp)
-                             else image_utils.apply_symmetry_to_static(inp, out, 'right'),
-            need_animated=False,
-            cmd="right"
-        ):
-            yield ret
-
-    @filter.regex(r'(?:\s|^)(上对称)(?:\s|$)')
-    async def top_symmetric(self, event: AstrMessageEvent):
-        target_image = await self._extract_image_from_event(event)
-        if not target_image:
-            async for ret in self._process_avatar_command(
-                event,
-                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'top'),
-                "top"
-            ):
-                yield ret
-            return
-
-        async for ret in self._process_image_command(
-            event,
-            lambda inp, out: image_utils.apply_symmetry_to_gif(inp, out, 'top')
-                             if image_utils.is_gif(inp)
-                             else image_utils.apply_symmetry_to_static(inp, out, 'top'),
-            need_animated=False,
-            cmd="top"
-        ):
-            yield ret
-
-    @filter.regex(r'(?:\s|^)(下对称)(?:\s|$)')
-    async def bottom_symmetric(self, event: AstrMessageEvent):
-        target_image = await self._extract_image_from_event(event)
-        if not target_image:
-            async for ret in self._process_avatar_command(
-                event,
-                lambda inp, out: image_utils.apply_symmetry_to_static(inp, out, 'bottom'),
-                "bottom"
-            ):
-                yield ret
-            return
-
-        async for ret in self._process_image_command(
-            event,
-            lambda inp, out: image_utils.apply_symmetry_to_gif(inp, out, 'bottom')
-                             if image_utils.is_gif(inp)
-                             else image_utils.apply_symmetry_to_static(inp, out, 'bottom'),
-            need_animated=False,
-            cmd="bottom"
-        ):
-            yield ret
-
-    @filter.regex(r'(?:\s|^)(奶龙)(?:\s|$|\d)?')
+    @filter.regex(r'(?:\s|^)(奶龙)(?:\s|$|\d)')
     async def send_meme(self, event: AstrMessageEvent):
+        if not self._require_wake_command(event):
+            return
         event.stop_event()
         if not self.meme_list:
             yield event.plain_result("暂时还没有表情包，快往 resources 文件夹里放一些图片吧~")
@@ -967,6 +936,8 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(变速)(?:\s|$|\d)')
     async def speed_gif(self, event: AstrMessageEvent):
+        if not self._require_wake_command(event):
+            return
         event.stop_event()
         message_str = event.message_str.strip()
         speed_match = re.search(r'变速\s*(\d+(?:\.\d+)?)', message_str)
@@ -974,12 +945,16 @@ class MemePlugin(Star):
             yield event.plain_result("请指定速度倍数，例如：/变速 2（2倍速）或 /变速 0.5（半速）")
             return
         speed_factor = float(speed_match.group(1))
+        if not math.isfinite(speed_factor) or speed_factor < 0:
+            yield event.plain_result("请输入有效的速度倍数（正数）")
+            return
+        speed_notice = ""
         if speed_factor < 0.1:
             speed_factor = 0.1
-            yield event.plain_result("速度不能低于0.1倍，已自动调整为0.1倍")
+            speed_notice = "速度不能低于0.1倍，已自动调整为0.1倍"
         elif speed_factor > 10:
             speed_factor = 10
-            yield event.plain_result("速度不能高于10倍，已自动调整为10倍")
+            speed_notice = "速度不能高于10倍，已自动调整为10倍"
 
         async for ret in self._process_image_command(
             event,
@@ -987,12 +962,15 @@ class MemePlugin(Star):
             need_animated=True,
             fail_msg="GIF处理失败，请确保文件是有效的GIF动图格式",
             cmd="speed",
-            factor=str(speed_factor).replace('.', '_')
+            factor=str(speed_factor).replace('.', '_'),
+            prepend_msg=speed_notice
         ):
             yield ret
 
     @filter.regex(r'(?:\s|^)(倒放)(?:\s|$)')
     async def reverse_gif(self, event: AstrMessageEvent):
+        if not self._require_wake_command(event):
+            return
         async for ret in self._process_image_command(
             event,
             image_utils.reverse_gif,
@@ -1004,6 +982,8 @@ class MemePlugin(Star):
 
     @filter.regex(r'(?:\s|^)(反色)(?:\s|$)')
     async def invert_image(self, event: AstrMessageEvent):
+        if not self._require_wake_command(event):
+            return
         target_image = await self._extract_image_from_event(event)
         if not target_image:
             async for ret in self._process_avatar_command(
@@ -1027,12 +1007,14 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(旋转)(?:\s|$)')
     async def rotate_image(self, event: AstrMessageEvent):
         """旋转图片，支持自定义角度，默认顺时针90°"""
+        if not self._require_wake_command(event):
+            return
         event.stop_event()
         message_str = event.message_str.strip()
-        
+
         # 剔除 @mention，避免 QQ 号被误识别为角度
         clean_msg = re.sub(r'@\S+', '', message_str)
-        
+
         # 解析角度：仅匹配紧邻"旋转"的数字（旋转180 / 旋转 90）
         angle_match = re.search(r'旋转\s*(\d+(?:\.\d+)?)', clean_msg)
         if angle_match:
@@ -1046,7 +1028,7 @@ class MemePlugin(Star):
                 return
         else:
             angle = 90
-        
+
         target_image = await self._extract_image_from_event(event)
         if not target_image:
             async for ret in self._process_avatar_command(
@@ -1072,6 +1054,8 @@ class MemePlugin(Star):
     @filter.regex(r'(?:\s|^)(镜像)(?:\s|$)')
     async def mirror_image_cmd(self, event: AstrMessageEvent):
         """对图片进行水平镜像翻转"""
+        if not self._require_wake_command(event):
+            return
         target_image = await self._extract_image_from_event(event)
         if not target_image:
             async for ret in self._process_avatar_command(
@@ -1092,55 +1076,6 @@ class MemePlugin(Star):
         ):
             yield ret
 
-    @filter.regex(r'(?:\s|^)(左右平移)(?:\s|$)')
-    async def shuffle_image_cmd(self, event: AstrMessageEvent):
-        """对图片进行左右平移处理，图像从左往右再往左来回往复移动，共30帧"""
-        target_image = await self._extract_image_from_event(event)
-        if not target_image:
-            async for ret in self._process_avatar_command(
-                event,
-                image_utils.shuffle_image,
-                "shuffle"
-            ):
-                yield ret
-            return
-
-        async for ret in self._process_image_command(
-            event,
-            lambda inp, out: image_utils.shuffle_gif(inp, out)
-                             if image_utils.is_gif(inp)
-                             else image_utils.shuffle_image(inp, out),
-            need_animated=False,
-            cmd="shuffle",
-            force_ext=".gif"
-        ):
-            yield ret
-
-
-    @filter.regex(r'(?:\s|^)(左右横跳)(?:\s|$)')
-    async def bounce_image_cmd(self, event: AstrMessageEvent):
-        """对图片进行左右横跳处理，图像左右振动，共12帧"""
-        target_image = await self._extract_image_from_event(event)
-        if not target_image:
-            async for ret in self._process_avatar_command(
-                event,
-                image_utils.bounce_image,
-                "bounce"
-            ):
-                yield ret
-            return
-
-        async for ret in self._process_image_command(
-            event,
-            lambda inp, out: image_utils.bounce_gif(inp, out)
-                             if image_utils.is_gif(inp)
-                             else image_utils.bounce_image(inp, out),
-            need_animated=False,
-            cmd="bounce",
-            force_ext=".gif"
-        ):
-            yield ret
-
     @filter.regex(r'(?:\s|^)(万花镜)(?:\s|$)')
     async def kaleidoscope_cmd(self, event: AstrMessageEvent):
         """万花镜：将图片处理为万花镜样式（八方向×五层放射铺排）。
@@ -1148,6 +1083,8 @@ class MemePlugin(Star):
         （共 40 张），图像由内到外逐层增大、允许部分重叠、外侧大图覆盖内侧小图，
         每张按所在方向对应的角度旋转，其余区域用透明填充。
         引用图片时处理引用图，未引用时默认处理目标用户头像（优先@用户，其次发言者）"""
+        if not self._require_wake_command(event):
+            return
         target_image = await self._extract_image_from_event(event)
         if not target_image:
             async for ret in self._process_avatar_command(
@@ -1174,6 +1111,9 @@ class MemePlugin(Star):
         支持 6-24 的偶数面镜子：万花筒12 / 16万花筒 / 8万花筒 等，默认12面。
         引用图片时处理引用图，未引用时默认处理目标用户头像（优先@用户，其次发言者）"""
         message_str = event.message_str.strip()
+
+        if not self._require_wake_command(event):
+            return
 
         # 解析面数：从消息中提取数字（支持6-24的偶数）
         match = re.search(r'(?:^|\s)(\d{1,2})\s*万花筒|万花筒\s*(\d{1,2})(?:\s|$)', message_str)
@@ -1213,10 +1153,9 @@ class MemePlugin(Star):
             yield ret
 
     @filter.regex(r'(?:\s|^)(添加)(?:\s|$)')
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_meme(self, event: AstrMessageEvent):
-        # 权限检查：仅允许主人（2406873379）使用
-        if str(event.get_sender_id()) != "2406873379":
-            yield event.plain_result("❌ 你没有权限使用此命令哦~只有主人才能添加表情包！")
+        if not self._require_wake_command(event):
             return
         event.stop_event()
         target_image = await self._extract_image_from_event(event)
@@ -1257,27 +1196,12 @@ class MemePlugin(Star):
         # 复用之前的下载逻辑，但返回原始路径
         if hasattr(image, 'file') and image.file:
             raw_name = image.file
-            safe_name = os.path.basename(raw_name)
-            data_dir = StarTools.get_data_dir()
-            image_cache_dir = data_dir / "image"
-            candidates = [
-                raw_name if os.path.isabs(raw_name) else None,
-                str(image_cache_dir / raw_name),
-                str(image_cache_dir / safe_name),
-                os.path.join(self.meme_dir, safe_name),
-                safe_name,
-            ]
-            seen = set()
-            unique_candidates = []
-            for p in candidates:
-                if p and p not in seen:
-                    seen.add(p)
-                    unique_candidates.append(p)
+            unique_candidates = self._local_image_candidates(raw_name)
 
             for path in unique_candidates:
                 if path and os.path.exists(path):
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    ext = os.path.splitext(safe_name)[1]
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    ext = os.path.splitext(os.path.basename(raw_name))[1]
                     dest = os.path.join(self.temp_dir, f"add_{timestamp}{ext}")
                     try:
                         shutil.copy2(path, dest)
@@ -1288,7 +1212,7 @@ class MemePlugin(Star):
                         continue
 
         if hasattr(image, 'url') and image.url:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             try:
                 async with self.session.get(image.url) as resp:
                     if resp.status != 200:
@@ -1321,8 +1245,5 @@ class MemePlugin(Star):
         # 关闭 HTTP 会话
         if hasattr(self, 'session') and not self.session.closed:
             await self.session.close()
-        try:
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-        except Exception as e:
-            logger.error(f"清理临时文件夹时出错: {e}")
+        # 清理过期临时文件（不删除整个目录，避免误删仍在处理中的文件）
+        self._clean_temp_files(max_age_hours=0)

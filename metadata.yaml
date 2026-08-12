@@ -1,6 +1,10 @@
-name: astrbot plugin nailong
+name: astrbot_plugin_nailong
 display_name: 奶龙
-desc: 一个塞了各种对称功能的奶龙
-version: v1.3.0
+desc: 随机奶龙表情包与图片处理插件，支持对称、变速、倒放、反色、旋转、镜像、万花镜、万花筒等效果，以及添加自定义表情
+version: 1.3.1
 author: Logxk
 repo: https://github.com/Logxk/nailong
+short_desc: 随机奶龙表情包与图片处理插件
+astrbot_version: ">=4.16"
+support_platforms:
+  - aiocqhttp

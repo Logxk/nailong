@@ -7,6 +7,9 @@ import math
 # 输入图片最长边上限：超限的输入图等比缩小，避免超大图导致处理过慢
 _MAX_INPUT_SIZE = 1024
 
+# 动图帧数上限：超过则拒绝处理，避免拆帧常驻内存导致 OOM
+_MAX_GIF_FRAMES = 300
+
 
 def _downscale_image(img: Image.Image, max_edge: int = _MAX_INPUT_SIZE) -> Image.Image:
     """等比缩小图片，使最长边不超过 max_edge，防止超大图处理过慢。
@@ -98,11 +101,12 @@ def process_gif_preserve(gif_path: str) -> Tuple[List[Image.Image],
     """
     提取 GIF/APNG 的所有帧、时长、 disposal 方式、循环次数及透明度信息。
 
-    - GIF：使用虚拟画布累积渲染，正确处理优化的 GIF（局部帧 + disposal）。
+    - GIF：使用虚拟画布累积渲染，正确处理优化的 GIF（局部帧 + disposal 1/2/3）。
     - APNG：PIL 的 PNG 读取器已按 APNG 规范（blend/disposal）逐帧正确合成，
       直接取用即可。若再对 APNG 帧做「alpha 混合 + 画布累积」的二次合成，
       会因 APNG 的 blend=0（source 替换）语义把已消失的旧像素残留下来，
       产生残影（ghosting）。
+    - 超大动图（最长边 > _MAX_INPUT_SIZE）先等比降采样，避免拆帧占用过多内存。
     失败时抛出异常。
     """
     frames = []
@@ -116,8 +120,26 @@ def process_gif_preserve(gif_path: str) -> Tuple[List[Image.Image],
             # APNG 动图：PIL 已按规范合成好帧，直接取用，不做二次合成
             is_apng = (img.format == 'PNG' and getattr(img, 'is_animated', False))
 
+            frame_count = 0
+            for _ in ImageSequence.Iterator(img):
+                frame_count += 1
+                if frame_count > _MAX_GIF_FRAMES:
+                    raise ValueError(
+                        f"动图帧数过多（>{_MAX_GIF_FRAMES} 帧），拒绝处理以避免内存溢出"
+                    )
+
+            # 超大动图先降采样，避免全分辨率拆帧占用过多内存
+            scale = 1.0
+            if max(img.size) > _MAX_INPUT_SIZE:
+                scale = _MAX_INPUT_SIZE / max(img.size)
+
+            def _scaled_size(size):
+                return (max(1, int(round(size[0] * scale))),
+                        max(1, int(round(size[1] * scale))))
+
             # 创建虚拟画布用于累积渲染（仅 GIF 需要）
-            canvas = Image.new('RGBA', img.size, (0, 0, 0, 0))
+            canvas = Image.new('RGBA', _scaled_size(img.size), (0, 0, 0, 0))
+            prev_snapshot = None  # disposal==3 帧绘制前的画布快照
             first_frame = True
 
             for frame in ImageSequence.Iterator(img):
@@ -130,6 +152,9 @@ def process_gif_preserve(gif_path: str) -> Tuple[List[Image.Image],
                         current_frame = frame.copy()
                     else:
                         current_frame = frame.convert('RGBA')
+                    if scale != 1.0:
+                        current_frame = current_frame.resize(
+                            _scaled_size(current_frame.size), Image.LANCZOS)
                     frames.append(current_frame)
                 else:
                     # 处理前一帧的 disposal（仅 GIF）
@@ -137,13 +162,30 @@ def process_gif_preserve(gif_path: str) -> Tuple[List[Image.Image],
                         prev_disposal = disposals[-1]
                         if prev_disposal == 2:
                             # 恢复到背景（清除画布）
-                            canvas = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                            canvas.close()
+                            canvas = Image.new('RGBA', _scaled_size(img.size), (0, 0, 0, 0))
+                        elif prev_disposal == 3 and prev_snapshot is not None:
+                            # 恢复到当前帧绘制前的画布状态（disposal=3: restore to previous）
+                            canvas.close()
+                            canvas = prev_snapshot.copy()
+                            prev_snapshot.close()
+                            prev_snapshot = None
+
+                    if disposal == 3:
+                        # 记录绘制当前帧前的画布快照，供下一帧 disposal=3 恢复
+                        prev_snapshot = canvas.copy()
+                    elif prev_snapshot is not None:
+                        prev_snapshot.close()
+                        prev_snapshot = None
 
                     # 将当前帧合成到画布上
                     if frame.mode == 'RGBA':
                         current_frame = frame.copy()
                     else:
                         current_frame = frame.convert('RGBA')
+                    if scale != 1.0:
+                        current_frame = current_frame.resize(
+                            _scaled_size(current_frame.size), Image.LANCZOS)
 
                     # 使用 alpha 通道作为掩码进行合成
                     alpha = current_frame.getchannel('A')
@@ -157,6 +199,8 @@ def process_gif_preserve(gif_path: str) -> Tuple[List[Image.Image],
 
                 first_frame = False
 
+            if prev_snapshot is not None:
+                prev_snapshot.close()
             canvas.close()
             return frames, durations, disposals, loop, transparencies
     except Exception as e:
@@ -239,13 +283,13 @@ def save_rgba_frames_as_gif(frames: List[Image.Image],
             for frame in rgba_frames:
                 palette = frame.convert('P', palette=Image.Palette.ADAPTIVE, colors=256)
                 palette_frames.append(palette)
-            
+
             transparency = None
             if rgba_frames[0].mode == 'RGBA':
                 alpha = rgba_frames[0].split()[3]
                 if alpha.getextrema()[0] < 255:
                     transparency = 0
-            
+
             palette_frames[0].save(
                 output_path,
                 save_all=True,
@@ -256,7 +300,7 @@ def save_rgba_frames_as_gif(frames: List[Image.Image],
                 disposal=2,
                 optimize=optimize_for_web
             )
-            
+
             for frame in palette_frames:
                 frame.close()
 
@@ -277,7 +321,7 @@ def adjust_gif_speed(gif_path: str, speed_factor: float, output_path: str) -> No
         rgba_frames = frames_to_rgba_preserve(frames)
         for f in frames:
             f.close()
-        
+
         if speed_factor >= 1:
             # 加速：采样帧，但采用平均采样而不是简单的::step
             # 比如加速2倍时，100帧采样到50帧；加速4倍时，采样到25帧
@@ -287,14 +331,15 @@ def adjust_gif_speed(gif_path: str, speed_factor: float, output_path: str) -> No
             selected_durations = [durations[i] if i < len(durations) else 100 for i in indices]
             save_rgba_frames_as_gif(selected_frames, selected_durations, loop, output_path, transparencies)
         else:
-            # 慢放：复制帧，同时延长每帧的显示时间
+            # 慢放：复制帧，每帧保留原始时长
+            # （若同时放大时长会导致实际减速 = (1/speed_factor)²，倍率失真）
             repeat = max(1, int(round(1 / speed_factor)))
             expanded_frames = []
             expanded_durations = []
             for i, frame in enumerate(rgba_frames):
                 for _ in range(repeat):
                     expanded_frames.append(frame.copy())
-                    expanded_durations.append(int(durations[i] * repeat) if i < len(durations) else 100)
+                    expanded_durations.append(durations[i] if i < len(durations) else 100)
             save_rgba_frames_as_gif(expanded_frames, expanded_durations, loop, output_path, transparencies)
     except Exception as e:
         for f in frames:
@@ -493,21 +538,18 @@ def rotate_image(image_path: str, output_path: str, angle: float) -> None:
                 img = img.convert('RGBA')
             elif img.mode != 'RGBA':
                 img = img.convert('RGB')
-            
+
             if angle % 90 == 0:
                 # 直角旋转：expand 即可完美贴合
                 rotation = angle % 360
                 if rotation == 0:
-                    img.save(output_path, format='PNG' if img.mode == 'RGBA' else 'JPEG')
+                    img.save(output_path, format='PNG')
                 else:
                     rotated = img.rotate(-angle, expand=True, fillcolor=(0, 0, 0, 0) if img.mode == 'RGBA' else (255, 255, 255))
-                    if img.mode == 'RGBA':
-                        rotated.save(output_path, format='PNG')
-                    else:
-                        rotated.save(output_path, format='JPEG')
+                    rotated.save(output_path, format='PNG')
                     rotated.close()
                 return
-            
+
             # 非直角旋转：先旋转到透明/白色画布，再裁切至内容边缘
             if img.mode == 'RGBA':
                 rotated = img.rotate(-angle, expand=True, fillcolor=(0, 0, 0, 0))
@@ -519,17 +561,14 @@ def rotate_image(image_path: str, output_path: str, angle: float) -> None:
                 # 找到非白色像素的边界框（允许近白色容差）
                 gray = rotated.convert('L')
                 bbox = gray.point(lambda p: 0 if p > 250 else 255).getbbox()
-            
+
             if bbox:
                 cropped = rotated.crop(bbox)
-                if cropped.mode == 'RGBA':
-                    cropped.save(output_path, format='PNG')
-                else:
-                    cropped.save(output_path, format='JPEG')
+                cropped.save(output_path, format='PNG')
                 cropped.close()
             else:
-                rotated.save(output_path, format='PNG' if rotated.mode == 'RGBA' else 'JPEG')
-            
+                rotated.save(output_path, format='PNG')
+
             rotated.close()
     except Exception as e:
         logger.error(f"静态图旋转处理失败 {image_path}: {e}", exc_info=True)
@@ -539,14 +578,14 @@ def rotate_gif(gif_path: str, output_path: str, angle: float) -> None:
     """GIF 旋转：90°/180°/270° 直接 expand；其他角度旋转后自动裁切至内容边缘"""
     if not is_gif(gif_path):
         raise ValueError("文件不是有效的GIF")
-    
+
     frames, durations, disposals, loop, transparencies = process_gif_preserve(gif_path)
-    
+
     try:
         rgba_frames = frames_to_rgba_preserve(frames)
         for f in frames:
             f.close()
-        
+
         if angle % 90 == 0:
             # 直角旋转：expand 即可
             rotation = int(angle % 360)
@@ -561,7 +600,7 @@ def rotate_gif(gif_path: str, output_path: str, angle: float) -> None:
                 f.close()
             save_rgba_frames_as_gif(new_frames, durations, loop, output_path, transparencies)
             return
-        
+
         # 非直角旋转：每帧旋转后裁切到内容边界
         rotated_frames = []
         union_bbox = None
@@ -578,10 +617,10 @@ def rotate_gif(gif_path: str, output_path: str, angle: float) -> None:
                     union_bbox[2] = max(union_bbox[2], bbox[2])
                     union_bbox[3] = max(union_bbox[3], bbox[3])
             rotated_frames.append(rotated)
-        
+
         for f in rgba_frames:
             f.close()
-        
+
         # 用统一边界裁切所有帧
         if union_bbox:
             cropped_frames = []
@@ -612,9 +651,9 @@ def mirror_image(image_path: str, output_path: str) -> None:
                 img = img.convert('RGBA')
             else:
                 img = img.convert('RGB')
-            
+
             mirrored = img.transpose(Image.FLIP_LEFT_RIGHT)
-            mirrored.save(output_path, format='PNG' if img.mode == 'RGBA' else 'JPEG')
+            mirrored.save(output_path, format='PNG')
             mirrored.close()
     except Exception as e:
         logger.error(f"静态图镜像处理失败 {image_path}: {e}", exc_info=True)
@@ -624,22 +663,22 @@ def mirror_gif(gif_path: str, output_path: str) -> None:
     """对GIF动图进行水平镜像翻转"""
     if not is_gif(gif_path):
         raise ValueError("文件不是有效的GIF")
-    
+
     frames, durations, disposals, loop, transparencies = process_gif_preserve(gif_path)
-    
+
     try:
         rgba_frames = frames_to_rgba_preserve(frames)
         for f in frames:
             f.close()
-        
+
         mirrored_frames = []
         for frame in rgba_frames:
             mirrored = frame.transpose(Image.FLIP_LEFT_RIGHT)
             mirrored_frames.append(mirrored)
-        
+
         for f in rgba_frames:
             f.close()
-        
+
         save_rgba_frames_as_gif(mirrored_frames, durations, loop, output_path, transparencies)
     except Exception as e:
         for f in frames:
@@ -652,315 +691,6 @@ def mirror_gif(gif_path: str, output_path: str) -> None:
                 f.close()
         logger.error(f"GIF镜像处理失败 {gif_path}: {e}", exc_info=True)
         raise
-
-def shuffle_image(image_path: str, output_path: str) -> None:
-    """对静态图片进行左右平移处理，从左往右正常，从右往左镜像"""
-    try:
-        with Image.open(image_path) as img:
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGBA')
-            else:
-                img = img.convert('RGB')
-            
-            w, h = img.size
-            
-            # 画布宽度：被引用图像的 4-5 倍，选择 5 倍以保证视觉效果
-            canvas_w = int(w * 5)
-            # 画布高度：被引用图像的 2-3 倍，选择 3 倍以保证垂直运动空间
-            canvas_h = int(h * 3)
-            
-            # 总帧数：30 帧（15 去 + 15 回），X 方向匀速，Y 方向简谐振动
-            total_frames = 30
-            half_frames = total_frames // 2
-            
-            frames = []
-            durations = []
-            
-            if img.mode != 'RGBA':
-                img_rgba = img.convert('RGBA')
-            else:
-                img_rgba = img
-            
-            start_x = -w
-            end_x = canvas_w
-            
-            # 垂直简谐振动参数
-            amplitude = max(1, int(h * 0.18))
-            center_y = (canvas_h - h) // 2
-            
-            # 前半段：从左往右；后半段：从右往左（均为匀速）
-            for i in range(total_frames):
-                if i < half_frames:
-                    progress = i / (half_frames - 1) if half_frames > 1 else 0.0
-                else:
-                    j = i - half_frames
-                    progress = 1.0 - (j / (half_frames - 1) if half_frames > 1 else 0.0)
-                
-                x_offset = int(start_x + (end_x - start_x) * progress)
-                
-                # 使用总帧进度产生简谐振动（一个完整正弦周期）
-                total_progress = i / (total_frames - 1) if total_frames > 1 else 0.0
-                y_offset = center_y + int(math.sin(total_progress * 2 * math.pi) * amplitude)
-                
-                canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
-                canvas.paste(img_rgba, (x_offset, y_offset), mask=img_rgba.split()[3] if img_rgba.mode == 'RGBA' else None)
-                frames.append(canvas)
-                durations.append(50)
-            
-            img_rgba.close()
-            img.close()
-            
-            save_rgba_frames_as_gif(frames, durations, 0, output_path, max_size=500, optimize_for_web=True)
-            
-    except Exception as e:
-        logger.error(f"静态图左右平移处理失败 {image_path}: {e}", exc_info=True)
-        raise
-
-def shuffle_gif(gif_path: str, output_path: str) -> None:
-    """对GIF动图进行左右平移处理，优化性能和兼容性"""
-    if not is_gif(gif_path):
-        raise ValueError("文件不是有效的GIF")
-    
-    frames, durations, disposals, loop, transparencies = process_gif_preserve(gif_path)
-    
-    try:
-        rgba_frames = frames_to_rgba_preserve(frames)
-        for f in frames:
-            f.close()
-        
-        if not rgba_frames:
-            raise ValueError("没有有效的帧数据")
-        
-        w, h = rgba_frames[0].size
-        
-        # 画布尺寸：满足 用户要求的 4-5 倍宽度和 2-3 倍高度 — 取 5 倍宽、3 倍高
-        canvas_w = int(w * 5)
-        canvas_h = int(h * 3)
-        
-        # 总移动帧数，和静态图保持一致（30 帧：15 去 + 15 回）
-        total_frames = 30
-        half_frames = total_frames // 2
-        
-        new_frames = []
-        new_durations = []
-        
-        start_x = -w
-        end_x = canvas_w
-        
-        # 垂直简谐振动参数
-        amplitude = max(1, int(h * 0.18))
-        
-        for i in range(total_frames):
-            # 选择一个源帧（循环使用原始帧以保持动感）
-            src = rgba_frames[i % len(rgba_frames)]
-            if src.mode != 'RGBA':
-                frame = src.convert('RGBA')
-            else:
-                frame = src.copy()
-            
-            if i < half_frames:
-                progress = i / (half_frames - 1) if half_frames > 1 else 0.0
-            else:
-                j = i - half_frames
-                progress = 1.0 - (j / (half_frames - 1) if half_frames > 1 else 0.0)
-            
-            x_offset = int(start_x + (end_x - start_x) * progress)
-            
-            total_progress = i / (total_frames - 1) if total_frames > 1 else 0.0
-            y_offset = (canvas_h - h) // 2 + int(math.sin(total_progress * 2 * math.pi) * amplitude)
-            
-            canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
-            mask = frame.split()[3]
-            canvas.paste(frame, (x_offset, y_offset), mask=mask)
-            
-            new_frames.append(canvas)
-            new_durations.append(50)
-            
-            frame.close()
-        
-        # 清理原始帧
-        for f in rgba_frames:
-            f.close()
-        
-        # 保存结果
-        save_rgba_frames_as_gif(new_frames, new_durations, loop, output_path, transparencies, max_size=500, optimize_for_web=True)
-        
-        # 清理新创建的帧
-        for f in new_frames:
-            f.close()
-            
-    except Exception as e:
-        for f in frames:
-            f.close()
-        if 'rgba_frames' in locals():
-            for f in rgba_frames:
-                f.close()
-        if 'new_frames' in locals():
-            for f in new_frames:
-                f.close()
-        logger.error(f"GIF左右平移处理失败 {gif_path}: {e}", exc_info=True)
-        raise
-
-def bounce_image(image_path: str, output_path: str) -> None:
-    """对静态图片进行蛙跳处理（向上跳跃，然后下落）"""
-    try:
-        with Image.open(image_path) as img:
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGBA')
-            else:
-                img = img.convert('RGB')
-            
-            w, h = img.size
-            
-            # 画布尺寸：给Y方向预留更多空间用于跳跃
-            padding_x = int(w * 0.15)  # X方向只需要轻微空间
-            padding_y = int(h * 0.5)   # Y方向预留更多空间用于跳跃
-            canvas_w = w + padding_x * 2
-            canvas_h = h + padding_y * 2
-            
-            # 跳跃参数
-            num_frames = 20
-            jump_height = padding_y      # 跳跃高度
-            sway_distance = padding_x    # 轻微摇晃
-            
-            frames = []
-            durations = []
-            
-            if img.mode != 'RGBA':
-                img_rgba = img.convert('RGBA')
-            else:
-                img_rgba = img
-            
-            import math
-            center_x = padding_x
-            center_y = padding_y
-            
-            for i in range(num_frames):
-                # 使用正弦函数模拟抛物线跳跃（0到pi，从起点到起点）
-                progress = i / (num_frames - 1)
-                angle = progress * math.pi  # 0 -> π，使用sin(angle)产生山峰
-                
-                # Y方向：抛物线运动（跳起再落下）
-                # sin(angle) 在 0 到 π 时从 0 上升到 1 再回到 0
-                y_offset = center_y - int(math.sin(angle) * jump_height)
-                
-                # X方向：轻微的左右摇晃（频率是Y的1.5倍，增加动感）
-                sway_angle = progress * math.pi * 3
-                x_offset = center_x + int(math.sin(sway_angle) * sway_distance * 0.6)
-                
-                canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
-                canvas.paste(img_rgba, (x_offset, y_offset), mask=img_rgba.split()[3] if img_rgba.mode == 'RGBA' else None)
-                frames.append(canvas)
-                
-                # 跳跃过程中的速度变化：上升快，下落也快
-                # 在最高点停留稍长一点
-                if progress < 0.4:
-                    durations.append(40)  # 上升快
-                elif progress < 0.6:
-                    durations.append(60)  # 最高点停留
-                else:
-                    durations.append(40)  # 下落快
-            
-            img_rgba.close()
-            img.close()
-            
-            save_rgba_frames_as_gif(frames, durations, 0, output_path, max_size=500, optimize_for_web=True)
-            
-    except Exception as e:
-        logger.error(f"静态图蛙跳处理失败 {image_path}: {e}", exc_info=True)
-        raise
-
-def bounce_gif(gif_path: str, output_path: str) -> None:
-    """对GIF动图进行蛙跳处理（向上跳跃，然后下落）"""
-    if not is_gif(gif_path):
-        raise ValueError("文件不是有效的GIF")
-    
-    frames, durations, disposals, loop, transparencies = process_gif_preserve(gif_path)
-    
-    try:
-        rgba_frames = frames_to_rgba_preserve(frames)
-        for f in frames:
-            f.close()
-        
-        if not rgba_frames:
-            raise ValueError("没有有效的帧数据")
-        
-        w, h = rgba_frames[0].size
-        
-        # 画布尺寸：给Y方向预留更多空间用于跳跃
-        padding_x = int(w * 0.15)  # X方向只需要轻微空间
-        padding_y = int(h * 0.5)   # Y方向预留更多空间用于跳跃
-        canvas_w = w + padding_x * 2
-        canvas_h = h + padding_y * 2
-        
-        # 跳跃参数
-        bounce_num_frames = 20
-        jump_height = padding_y      # 跳跃高度
-        sway_distance = padding_x    # 轻微摇晃
-        
-        # 生成新的帧序列
-        new_frames = []
-        new_durations = []
-        
-        import math
-        center_x = padding_x
-        center_y = padding_y
-        
-        # 为每一帧添加蛙跳效果
-        for frame_idx, frame in enumerate(rgba_frames):
-            # 确保帧是RGBA模式
-            if frame.mode != 'RGBA':
-                frame = frame.convert('RGBA')
-            
-            # 为这一帧生成多个跳跃变体
-            for bounce_idx in range(bounce_num_frames):
-                progress = bounce_idx / (bounce_num_frames - 1)
-                angle = progress * math.pi  # 0 -> π
-                
-                # Y方向：抛物线运动（跳起再落下）
-                y_offset = center_y - int(math.sin(angle) * jump_height)
-                
-                # X方向：轻微的左右摇晃（频率是Y的1.5倍）
-                sway_angle = progress * math.pi * 3
-                x_offset = center_x + int(math.sin(sway_angle) * sway_distance * 0.6)
-                
-                canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
-                mask = frame.split()[3]
-                canvas.paste(frame, (x_offset, y_offset), mask=mask)
-                
-                new_frames.append(canvas)
-                
-                # 跳跃过程中的速度变化
-                if progress < 0.4:
-                    new_durations.append(40)  # 上升快
-                elif progress < 0.6:
-                    new_durations.append(60)  # 最高点停留
-                else:
-                    new_durations.append(40)  # 下落快
-        
-        # 清理原始帧
-        for f in rgba_frames:
-            f.close()
-        
-        # 保存结果
-        save_rgba_frames_as_gif(new_frames, new_durations, loop, output_path, transparencies, max_size=500, optimize_for_web=True)
-        
-        # 清理新创建的帧
-        for f in new_frames:
-            f.close()
-            
-    except Exception as e:
-        for f in frames:
-            f.close()
-        if 'rgba_frames' in locals():
-            for f in rgba_frames:
-                f.close()
-        if 'new_frames' in locals():
-            for f in new_frames:
-                f.close()
-        logger.error(f"GIF蛙跳处理失败 {gif_path}: {e}", exc_info=True)
-        raise
-
 
 def kaleidoscope_image(image_path: str, output_path: str, segments: int = 12, max_size: int = 500) -> None:
     """对静态图片应用万花镜效果：八方向×五层放射铺排，失败抛出异常
@@ -1069,11 +799,11 @@ def kaleidoscope_gif(gif_path: str, output_path: str, segments: int = 12, max_si
         rgba_frames = frames_to_rgba_preserve(frames)
         for f in frames:
             f.close()
-        
+
         processed_frames = []
         import tempfile
         import os as _os
-        
+
         for frame in rgba_frames:
             # Save frame to temp file and process
             tmp_in = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
@@ -1096,15 +826,15 @@ def kaleidoscope_gif(gif_path: str, output_path: str, segments: int = 12, max_si
                 for p in [tmp_in.name, tmp_out.name]:
                     if _os.path.exists(p):
                         _os.remove(p)
-        
+
         for f in rgba_frames:
             f.close()
-        
+
         # Build new duration list matching frame count
         new_durations = []
         for i in range(len(processed_frames)):
             new_durations.append(durations[i % len(durations)])
-        
+
         save_rgba_frames_as_gif(processed_frames, new_durations, loop, output_path, transparencies)
     except Exception as e:
         for f in frames:
